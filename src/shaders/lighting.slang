@@ -1,5 +1,5 @@
 // Deferred lighting: one downward facing ceiling light, ambient scaled by SSAO, Reinhard tone mapping.
-#include "common.slang"
+import common;
 
 Texture2D<float4> g_Albedo;
 Texture2D<float4> g_Normal;
@@ -9,6 +9,12 @@ Texture2D<float> g_AO;
 float3 Output(float3 colour)
 {
 	return g_Frame.applyGamma != 0 ? pow(saturate(colour), 1.0f / 2.2f) : saturate(colour);
+}
+
+[shader("vertex")]
+float4 vsFullscreen(uint vertexId: SV_VertexID) : SV_Position
+{
+	return FullscreenPosition(vertexId);
 }
 
 [shader("fragment")]

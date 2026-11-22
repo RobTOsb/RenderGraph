@@ -1,6 +1,6 @@
 // Cornell box geometry: the prepass uses psPrepass and the G-buffer pass psGBuffer.
 // Both pipelines share vsMain, so the prepass depth matches exactly for the EQUAL depth test.
-#include "common.slang"
+import common;
 
 struct Vertex
 {

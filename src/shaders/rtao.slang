@@ -1,7 +1,7 @@
 // Ray traced AO: a primary ray per pixel finds the surface, then cosine weighted hemisphere rays from it test
 // occlusion, all with inline ray queries against the scene TLAS. It needs nothing from the raster passes, so
 // it runs on async compute beside them. Same output and 4x4 interleaved rotation as SSAO, so csBlur denoises it.
-#include "common.slang"
+import common;
 
 // Matches Vertex in scene.slang and main.cpp.
 struct SceneVertex

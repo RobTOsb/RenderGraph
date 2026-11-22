@@ -1,7 +1,7 @@
 // World space SSAO with a 4x4 interleaved rotation pattern, then a depth aware 4x4 blur that removes it.
 // Both run on the async compute queue and read only the prepass's normal and depth, so they overlap the G-buffer.
 // Checks are written as !(x > limit) so NaN inputs fail them too, and both passes never output NaN.
-#include "common.slang"
+import common;
 
 Texture2D<float4> g_Input; // xyz world space normal, w reversed Z depth (0 where nothing was drawn)
 Texture2D<float> g_AO;

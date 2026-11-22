@@ -516,3 +516,125 @@ RG_TEST(RaytracingBuildsAndTracesInOrder)
 		rc.DestroyResource(queryOutHandle);
 	}
 }
+
+// The BLAS is built in the first frame only, and the TLAS every frame into a transient buffer with a transient
+// scratch, over a graph reset and recompiled each frame. The instance is masked out on odd frames, so every query
+// sees that frame's build.
+RG_TEST(TransientTLASIsRebuiltEveryFrame)
+{
+	GpuTest gpu;
+	RenderContext &rc = gpu.rc();
+	if (!SupportsRaytracing(rc))
+	{
+		std::printf("  (ray tracing not supported: skipped)\n");
+		return;
+	}
+
+	const PipelineHandle trianglePipeline = rc.CreateComputePipeline(ShaderPath("triangle.slang"), "main");
+	const PipelineHandle queryPipeline = rc.CreateComputePipeline(ShaderPath("rt_query.slang"), "main");
+	assert(trianglePipeline != InvalidPipelineHandle && queryPipeline != InvalidPipelineHandle);
+
+	for (const QueueType queue: { QueueType::Graphics, QueueType::Compute })
+	{
+		Scene scene(gpu);
+		const ResourceHandle queryOutHandle = gpu.CreateBuffer(kElements, "QueryOut");
+		const TLASBuildSizes sizes = rc.GetTLASBuildSizes(scene.tlas);
+		assert(sizes.resultBytes > 0 && sizes.scratchBytes > 0);
+
+		RenderGraph graph;
+		ResourceHandle firstTlas = InvalidResourceHandle;
+		for (uint32_t frame = 0; frame < 4; ++frame)
+		{
+			graph.Reset();
+			const auto blas = graph.ImportBuffer(rc.GetAccelerationStructureResource(scene.blas), "BLAS");
+			const auto queryOut = graph.ImportBuffer(queryOutHandle, "QueryOut");
+			BufferDesc tlasDesc;
+			tlasDesc.sizeInBytes = sizes.resultBytes;
+			tlasDesc.debugName = "TLAS";
+			const auto tlas = graph.CreateBuffer(tlasDesc, ResourceViewType::ShaderResource);
+			const auto scratch = graph.CreateBuffer(UIntBuffer(static_cast<uint32_t>(sizes.scratchBytes / 4), "Scratch"));
+
+			if (frame == 0)
+			{
+				const auto vertices = graph.ImportBuffer(scene.vertices, "Vertices");
+				const auto indices = graph.ImportBuffer(scene.indices, "Indices");
+				graph.AddPass(Pass::Compute("WriteTriangle")
+									  .OnQueue(queue)
+									  .Use(vertices, Access::ComputeShaderWrite)
+									  .Use(indices, Access::ComputeShaderWrite)
+									  .Executes(
+											  [&, vertices, indices](PassContext &ctx)
+											  {
+												  ctx.rc.SetComputePipeline(trianglePipeline);
+												  ctx.rc.SetComputeUAVByName("Vertices", ctx.Get(vertices));
+												  ctx.rc.SetComputeUAVByName("Indices", ctx.Get(indices));
+												  ctx.rc.Dispatch(1, 1, 1);
+											  }));
+				graph.AddPass(Pass::Compute("BuildBLAS")
+									  .OnQueue(queue)
+									  .Use(vertices, Access::AccelerationStructureBuildInput)
+									  .Use(indices, Access::AccelerationStructureBuildInput)
+									  .Use(blas, Access::AccelerationStructureBuildWrite)
+									  .Executes([&](PassContext &ctx) { ctx.rc.BuildAccelerationStructure(scene.blas); }));
+			}
+
+			TLASInstance instance;
+			instance.blas = scene.blas;
+			instance.transform[0][0] = instance.transform[1][1] = instance.transform[2][2] = 1.0f;
+			instance.instanceMask = frame % 2 == 0 ? 0xFF : 0;
+			graph.AddPass(Pass::Compute("BuildTLAS")
+								  .OnQueue(queue)
+								  .Use(blas, Access::AccelerationStructureBuildRead)
+								  .Use(scratch, Access::AccelerationStructureScratch)
+								  .Use(tlas, Access::AccelerationStructureBuildWrite)
+								  .Executes(
+										  [&](PassContext &ctx)
+										  {
+											  ctx.rc.BuildTLASInto(scene.tlas,
+																   ctx.Get(tlas),
+																   ctx.Get(scratch),
+																   std::span<const TLASInstance>(&instance, 1));
+										  }));
+			graph.AddPass(Pass::Compute("Query")
+								  .OnQueue(queue)
+								  .Use(tlas, Access::AccelerationStructureRead)
+								  .Use(queryOut, Access::ComputeShaderWrite)
+								  .Executes(
+										  [&](PassContext &ctx)
+										  {
+											  ctx.rc.SetComputePipeline(queryPipeline);
+											  ctx.rc.SetComputeSRVByName("Scene", ctx.Get(tlas));
+											  ctx.rc.SetComputeUAVByName("Output", ctx.Get(queryOut));
+											  ctx.rc.Dispatch(1, 1, 1);
+										  }));
+			const bool compiled = graph.Compile(rc);
+			if (!compiled)
+			{
+				std::fprintf(stderr, "%s\n", graph.GetError().c_str());
+			}
+			assert(compiled);
+
+			gpu.BeginFrame();
+			graph.Execute(rc);
+			gpu.EndFrame();
+
+			// Frames 1 to 3 have the same transients, so they reuse frame 0's placed buffers.
+			if (frame == 0)
+			{
+				firstTlas = graph.GetHandle(tlas);
+			}
+			assert(graph.GetHandle(tlas) == firstTlas);
+
+			const bool visible = frame % 2 == 0;
+			AssertBufferEquals(
+					gpu.Read(queryOutHandle, kElements),
+					[&](uint32_t i) { return visible && RayHits(i) ? 1u : 2u; },
+					"QueryOut",
+					&graph);
+		}
+
+		graph.ReleaseResources();
+		scene.Destroy(gpu);
+		rc.DestroyResource(queryOutHandle);
+	}
+}

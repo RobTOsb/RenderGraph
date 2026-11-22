@@ -273,6 +273,81 @@ RG_TEST(AliasingNeverOverlapsLiveMemoryRandomized)
 	}
 }
 
+// C lives on async compute in section 1, G on graphics in section 2. Sharing memory would make graphics wait for
+// compute only to keep it safe, so they share it only when graphics already waits, here for the data in OutC.
+RG_TEST(QueuesShareMemoryOnlyWhereTheyAlreadyWait)
+{
+	GpuTest gpu;
+	const ResourceHandle outCHandle = gpu.CreateBuffer(kCount, "OutC");
+	const ResourceHandle outGHandle = gpu.CreateBuffer(kCount, "OutG");
+	const ResourceHandle busyHandle = gpu.CreateBuffer(kCount, "Busy");
+
+	for (const bool graphicsReadsCompute: { false, true })
+	{
+		RenderGraph graph;
+		const auto c = graph.CreateBuffer(UIntBuffer(kCount, "C"));
+		const auto g = graph.CreateBuffer(UIntBuffer(kCount, "G"));
+		const auto outC = graph.ImportBuffer(outCHandle, "OutC");
+		const auto outG = graph.ImportBuffer(outGHandle, "OutG");
+		const auto busy = graph.ImportBuffer(busyHandle, "Busy");
+
+		graph.AddPass(Pass::Compute("Busy").Writes(busy).Executes([&](PassContext &ctx) { gpu.Fill(ctx, busy, 7, kCount); }));
+		graph.AddPass(Pass::Compute("FillC").OnQueue(kCompute).Writes(c).Executes(
+				[&](PassContext &ctx) { gpu.Fill(ctx, c, 300, kCount); }));
+		graph.AddPass(Pass::Compute("CtoOutC").OnQueue(kCompute).Reads(c).Writes(outC).Executes(
+				[&](PassContext &ctx) { gpu.Add(ctx, c, outC, 5, kCount); }));
+		graph.Submit();
+		graph.AddPass(Pass::Compute("FillG").Writes(g).Executes([&](PassContext &ctx) { gpu.Fill(ctx, g, 100, kCount); }));
+		if (graphicsReadsCompute)
+		{
+			graph.AddPass(Pass::Compute("GtoOutG").Reads(g).Reads(outC).Writes(outG).Executes(
+					[&](PassContext &ctx) { gpu.Add(ctx, g, outG, 3, kCount); }));
+		}
+		else
+		{
+			graph.AddPass(Pass::Compute("GtoOutG").Reads(g).Writes(outG).Executes(
+					[&](PassContext &ctx) { gpu.Add(ctx, g, outG, 3, kCount); }));
+		}
+		const bool compiled = graph.Compile(gpu.rc());
+		if (!compiled)
+		{
+			std::fprintf(stderr, "%s\n", graph.GetError().c_str());
+		}
+		assert(compiled);
+
+		bool graphicsWaitsInSection2 = false;
+		for (const rg::QueueWaitInfo &wait: graph.GetQueueWaits())
+		{
+			graphicsWaitsInSection2 = graphicsWaitsInSection2 ||
+									  (wait.waitingQueue == kGraphics && wait.waitingSection == kSection + 1);
+		}
+		const auto allocC = *graph.GetTransientAllocation(c);
+		const auto allocG = *graph.GetTransientAllocation(g);
+		assert(!LifetimesOverlap(allocC, allocG));
+		if (graphicsReadsCompute)
+		{
+			assert(graphicsWaitsInSection2 && "OutC is handed to graphics");
+			assert(MemoryOverlaps(allocC, allocG) && "graphics waits anyway, so G reuses C's memory");
+			assert(graph.GetTransientMemorySize() == allocC.size);
+		}
+		else
+		{
+			assert(!graphicsWaitsInSection2 && "nothing graphics needs comes from compute");
+			assert(!MemoryOverlaps(allocC, allocG) && "reusing C's memory would need a wait");
+		}
+
+		gpu.BeginFrame();
+		graph.Execute(gpu.rc());
+		gpu.EndFrame();
+		AssertBufferEquals(gpu.Read(outCHandle, kCount), [](uint32_t i) { return 300 + i + 5; }, "OutC", &graph);
+		AssertBufferEquals(gpu.Read(outGHandle, kCount), [](uint32_t i) { return 100 + i + 3; }, "OutG", &graph);
+		graph.ReleaseResources();
+	}
+	gpu.rc().DestroyResource(outCHandle);
+	gpu.rc().DestroyResource(outGHandle);
+	gpu.rc().DestroyResource(busyHandle);
+}
+
 // Transients in a section using both queues live for the whole section, so nothing there aliases.
 // The same passes on one queue let G0 and G2 share memory.
 RG_TEST(AsyncSectionsDoNotAliasAcrossQueues)

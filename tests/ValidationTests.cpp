@@ -120,9 +120,19 @@ RG_TEST(InvalidGraphsAreRejected)
 					   graph.AddPass(Pass::Graphics("Shade").Use(x, Access::ShadingRateSource));
 				   });
 
-	// The graph cannot create acceleration structures, so a transient buffer cannot be one.
+	// A transient acceleration structure is only built and traced, so it is not also a plain buffer.
 	ExpectRejected(gpu,
-				   "acceleration structures come from the RenderContext",
+				   "is an acceleration structure in pass 'Build' and a plain buffer in pass 'Shade'",
+				   [](RenderGraph &graph)
+				   {
+					   const auto x = graph.CreateBuffer(UIntBuffer(kCount, "X"), ResourceViewType::ShaderResource);
+					   graph.AddPass(Pass::Compute("Build").Use(x, Access::AccelerationStructureBuildWrite));
+					   graph.AddPass(Pass::Compute("Shade").Reads(x));
+				   });
+
+	// Its one view is the acceleration structure SRV rays trace.
+	ExpectRejected(gpu,
+				   "needs a ShaderResource view",
 				   [](RenderGraph &graph)
 				   {
 					   const auto x = graph.CreateBuffer(UIntBuffer(kCount, "X"));

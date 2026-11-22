@@ -69,7 +69,8 @@ namespace rg
 		DepthStencilWrite, // textures only
 		DepthStencilRead, // textures only
 
-		// Ray tracing. Acceleration structures come from the RenderContext, so they are always imported buffers.
+		// Ray tracing. Acceleration structures are imported from the RenderContext, or transient buffers a pass builds
+		// into each execution (a TLAS over static BLASes), which then take only acceleration structure accesses.
 		RaytracingShaderRead, // SRV in DispatchRays shaders
 		RaytracingShaderWrite, // UAV in DispatchRays shaders
 		AccelerationStructureRead, // TraceRay, or inline ray queries in any shader stage
@@ -233,6 +234,8 @@ namespace rg
 		bool optimizeLifetimes = true;
 		// Sort passes inside each batch by kind (copy, compute, raster).
 		bool sortBatchesByPassKind = true;
+
+		bool operator==(const CompileOptions &) const = default;
 	};
 
 	enum class BarrierKind : uint8_t
@@ -271,6 +274,15 @@ namespace rg
 		uint32_t waitingSection = 0;
 		QueueType signalQueue = QueueType::Graphics;
 		uint32_t signalSection = 0;
+	};
+
+	// A pass's GPU time, from the profile scope Execute wraps it in when profiling is on.
+	struct PassTiming
+	{
+		std::string name;
+		QueueType queue = QueueType::Graphics;
+		uint32_t section = 0;
+		GPUProfileScopeStats stats;
 	};
 
 	struct TransientAllocation
@@ -335,9 +347,22 @@ namespace rg
 		// Ends the current section: a submit point. Resources can only change queues here.
 		void Submit();
 
+		// Clears every pass and resource so the graph can be recorded again, such as once per frame.
+		// GPU objects stay alive, so a recompile that needs the same resources gets the same handles.
+		// The compiled graph is set aside, for Compile to take back if the recording turns out the same.
+		void Reset();
+
 		// Validates, schedules, places transient memory and computes barriers and queue syncs. Returns
 		// false and sets GetError() if the graph is invalid. Needs the context for allocation sizes.
+		// Can be called again at any time, such as every frame after Reset(). After Reset(), a recording that
+		// declares the same graph as the last compile reuses its result, taking only the new pass callbacks
+		// and import handles, so recording every frame only pays for a compile when the structure changes.
 		bool Compile(RenderContext &rc, const CompileOptions &options = {});
+		// True when the last Compile reused the previous result instead of compiling.
+		bool WasLastCompileReused() const
+		{
+			return lastCompileReused_;
+		}
 		const std::string &GetError() const
 		{
 			return error_;
@@ -348,9 +373,10 @@ namespace rg
 		}
 
 		// Call inside a frame with the graphics list open; it leaves graphics open and compute submitted.
-		// Creates the transient heap and resources on first use.
+		// Places the transient resources, reusing those from earlier executions with the same description
+		// and heap offset. What is no longer needed is destroyed once the GPU is past its last use.
 		void Execute(RenderContext &rc);
-		// Destroys the transient resources and heap. The GPU must be done with them.
+		// Destroys every GPU object the graph made, retired ones included. The GPU must be done with them.
 		void ReleaseResources();
 
 		// Introspection
@@ -364,6 +390,16 @@ namespace rg
 		}
 		uint32_t GetBatchCount(uint32_t section, QueueType queue) const;
 		uint32_t GetTotalBatchCount() const;
+
+		// Times every pass on the GPU, in a profile scope of the context named after the pass. Off by default,
+		// since each pass costs two timestamps.
+		void SetProfilePasses(bool enabled)
+		{
+			profilePasses_ = enabled;
+		}
+		// The compiled passes' timings in execution order: by section, then queue. A pass with no samples yet
+		// has a sampleCount of 0. Samples arrive a few frames after the passes run.
+		std::vector<PassTiming> GetPassTimings(const RenderContext &rc) const;
 		const CompiledBatch &GetBatch(uint32_t section, QueueType queue, uint32_t index) const;
 		std::span<const BarrierInfo> GetQueueReleases(uint32_t section, QueueType queue) const;
 		// The queue submits at the end of the section, because another queue waits on it.
@@ -401,12 +437,40 @@ namespace rg
 	private:
 		static constexpr uint32_t kNoNode = UINT32_MAX;
 
-		struct TextureViews
+		// A placed resource kept between compiles, found again by its description and heap offset.
+		struct PlacedResource
+		{
+			bool isTexture = false;
+			TextureDesc textureDesc;
+			BufferDesc bufferDesc;
+			ResourceViewType viewType = ResourceViewType::ShaderResource;
+			uint64_t offset = 0;
+			bool committed = false; // made outside the heap, so it survives the heap growing
+			ResourceHandle handle = InvalidResourceHandle;
+			uint64_t lastUsed = 0; // execution number
+		};
+
+		// An SRV or UAV of one mip or of a whole texture, made on first use and kept between compiles.
+		struct CachedView
 		{
 			ResourceHandle texture = InvalidResourceHandle;
-			ResourceHandle srv = InvalidResourceHandle;
-			ResourceHandle uav = InvalidResourceHandle;
+			uint32_t baseMip = 0;
+			uint32_t mipCount = 0; // 0 for every mip
+			bool unorderedAccess = false;
+			ResourceHandle view = InvalidResourceHandle;
+			uint64_t lastUsed = 0;
 		};
+
+		// GPU objects no longer needed, destroyed once each queue is past its sync point.
+		struct RetiredObjects
+		{
+			std::vector<ResourceHandle> resources; // views before the textures they view
+			MemoryHeapHandle heap = InvalidMemoryHeapHandle;
+			QueueSyncPoint syncPoints[kQueueTypeCount];
+		};
+
+		// Cached objects unused for this many executions are retired.
+		static constexpr uint64_t kRetireAfterUnusedExecutions = 60;
 
 		struct ResourceNode
 		{
@@ -423,7 +487,6 @@ namespace rg
 			uint32_t parent = kNoNode;
 			uint32_t mip = 0;
 			std::vector<uint32_t> mips; // mip nodes by mip, kNoNode for one not created yet
-			mutable std::vector<TextureViews> views; // SRV and UAV views per texture handle, made on first use
 			ResourceState trackedState; // imports: the context's state when Execute starts
 
 			// Transient memory.
@@ -486,10 +549,21 @@ namespace rg
 		}
 		// Accessed by some pass, directly or through its mips.
 		bool IsUsed(const ResourceNode &node) const;
-		// Placed in transient memory: a used transient that is not a mip.
+		static bool HoldsAccelerationStructure(const ResourceNode &node)
+		{
+			return !node.isTexture && (static_cast<uint32_t>(node.bufferDesc.usageFlags) &
+									   static_cast<uint32_t>(ResourceUsageFlags::AccelerationStructure)) != 0;
+		}
+		// Placed in transient memory: a used transient that is not a mip, nor an acceleration structure.
 		bool OwnsTransientMemory(const ResourceNode &node) const
 		{
-			return !node.imported && node.parent == kNoNode && IsUsed(node);
+			return !node.imported && node.parent == kNoNode && IsUsed(node) && !HoldsAccelerationStructure(node);
+		}
+		// A used transient acceleration structure, which gets its own committed buffer: PIX fails to capture one
+		// placed over memory another resource has used.
+		bool IsCommittedTransient(const ResourceNode &node) const
+		{
+			return !node.imported && IsUsed(node) && HoldsAccelerationStructure(node);
 		}
 		// SRV or UAV view of a mip or of a whole texture, made on first use.
 		ResourceHandle GetView(RenderContext &rc, uint32_t resource, bool unorderedAccess) const;
@@ -508,6 +582,9 @@ namespace rg
 		uint64_t ResourceArea(const ResourceNode &node) const;
 		void OptimizeLifetimes();
 		void BuildBatches(const CompileOptions &options);
+		// The waits the data needs: imports going to and from the graphics queue, and resources handed between
+		// queues. Placement reads them, since it only lets queues share memory where they already wait.
+		void AddDataWaits();
 		void PlaceTransientMemory(bool alias);
 		void BuildBarriersAndSyncs();
 		void AddQueueWait(QueueType waitingQueue,
@@ -515,7 +592,13 @@ namespace rg
 						  QueueType signalQueue,
 						  uint32_t signalSection);
 		void FinaliseQueueWaits();
-		void CreateTransientResources(RenderContext &rc);
+		// Points each transient at a cached or new placed resource, growing the heap if needed.
+		void RealiseResources(RenderContext &rc);
+		// Queues objects for destruction once the GPU is past everything recorded so far.
+		void Retire(RenderContext &rc, RetiredObjects objects);
+		void DestroyRetired(RenderContext &rc, bool all);
+		// Moves the views of texture into objects, so they go before it.
+		void TakeViews(ResourceHandle texture, RetiredObjects &objects);
 		ResourceTransitionDesc ResolveBarrier(const BarrierInfo &barrier) const;
 		void RecordBarrierList(RenderContext &rc,
 							   std::span<const BarrierInfo> barriers,
@@ -541,9 +624,59 @@ namespace rg
 		uint64_t transientMemorySize_ = 0;
 		bool usesComputeQueue_ = false;
 
+		// Everything Compile reads from a recording, so equal declarations compile to the same graph. Pass callbacks
+		// and import handles are left out: Execute reads them.
+		struct DeclaredResource
+		{
+			std::string name;
+			bool imported = false;
+			bool isTexture = false;
+			BufferDesc bufferDesc;
+			TextureDesc textureDesc;
+			ResourceViewType viewType = ResourceViewType::ShaderResource;
+			uint32_t parent = kNoNode;
+			uint32_t mip = 0;
+			uint32_t importedMipLevels = 0; // an import used by mip: its mip count, which the context reports
+		};
+		struct DeclaredPass
+		{
+			std::string name;
+			PassKind kind = PassKind::Compute;
+			QueueType queue = QueueType::Graphics;
+			uint32_t section = 0;
+			std::vector<Attachment> attachments;
+		};
+		struct Declarations
+		{
+			std::vector<DeclaredResource> resources;
+			std::vector<DeclaredPass> passes;
+			uint32_t sectionCount = 0;
+			CompileOptions options;
+		};
+		static bool SameDeclarations(const Declarations &a, const Declarations &b);
+		// Fills declarations in place, so its strings and vectors keep their capacity from frame to frame.
+		void CaptureDeclarations(RenderContext &rc, const CompileOptions &options, Declarations &declarations) const;
+		// Takes back the compiled graph Reset set aside, with this recording's callbacks and import handles.
+		void ReuseStashedCompile();
+
+		Declarations declarations_; // this recording's, made by Compile
+		Declarations compiledDeclarations_; // the last successful compile's
+		bool hasCompiledDeclarations_ = false;
+		std::vector<ResourceNode> stashedResources_;
+		std::vector<PassNode> stashedPasses_;
+		bool stashed_ = false;
+		bool lastCompileReused_ = false;
+		bool profilePasses_ = false;
+
 		// Realised state.
 		RenderContext *realisedContext_ = nullptr;
 		MemoryHeapHandle heap_ = InvalidMemoryHeapHandle;
+		uint64_t heapSize_ = 0;
+		std::vector<PlacedResource> placed_;
+		mutable std::vector<CachedView> views_;
+		std::vector<RetiredObjects> retired_;
+		uint64_t executions_ = 0;
+		bool lastExecuteUsedCompute_ = false;
 		std::vector<ExecutionEvent> trace_;
 
 		friend class PassContext;

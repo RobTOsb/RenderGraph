@@ -1,30 +1,74 @@
-// Ray traced AO: cosine weighted hemisphere rays against the scene TLAS with inline ray queries.
-// Same inputs, output and 4x4 interleaved rotation as SSAO, so csBlur in ssao.slang denoises it too.
+// Ray traced AO: a primary ray per pixel finds the surface, then cosine weighted hemisphere rays from it test
+// occlusion, all with inline ray queries against the scene TLAS. It needs nothing from the raster passes, so
+// it runs on async compute beside them. Same output and 4x4 interleaved rotation as SSAO, so csBlur denoises it.
 #include "common.slang"
 
-Texture2D<float4> g_Input; // xyz world space normal, w reversed Z depth (0 where nothing was drawn)
+// Matches Vertex in scene.slang and main.cpp.
+struct SceneVertex
+{
+	float3 position;
+	float3 normal;
+	float3 albedo;
+	float emissive;
+};
+
+StructuredBuffer<SceneVertex> g_Vertices;
+StructuredBuffer<uint> g_Indices; // the BLAS triangles, three per primitive
 RaytracingAccelerationStructure g_Scene;
+RWTexture2D<float4> g_Surface; // what the blur reads: xyz world space normal, w reversed Z depth (0 for background)
 RWTexture2D<float> g_Out;
 
 static const uint kRayCount = 8; // per pixel; the blur averages 16 pixels, so 128 directions in all
 static const float kPi = 3.14159265f;
 
+typedef RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> SceneQuery;
+
+// The surface the rasterizer shows at the pixel centre: the camera ray from the near plane, as raster clipping has it.
+bool TracePrimary(int2 pixel, out float3 position, out float3 normal, out float depth)
+{
+	position = 0.0f;
+	normal = 0.0f;
+	depth = 0.0f;
+	const float3 nearPoint = ReconstructWorld(float2(pixel) + 0.5f, 1.0f); // reversed Z: 1 is the near plane
+	RayDesc ray;
+	ray.Origin = nearPoint;
+	ray.Direction = normalize(nearPoint - g_Frame.cameraPos);
+	ray.TMin = 0.0f;
+	ray.TMax = g_Frame.farZ;
+
+	SceneQuery query;
+	query.TraceRayInline(g_Scene, RAY_FLAG_NONE, 0xFF, ray);
+	query.Proceed();
+	if (query.CommittedStatus() != COMMITTED_TRIANGLE_HIT)
+	{
+		return false;
+	}
+
+	// Interpolated vertex normals, like the G-buffer's.
+	const uint first = query.CommittedPrimitiveIndex() * 3;
+	const float2 bary = query.CommittedTriangleBarycentrics();
+	normal = normalize(g_Vertices[g_Indices[first]].normal * (1.0f - bary.x - bary.y) +
+					   g_Vertices[g_Indices[first + 1]].normal * bary.x + g_Vertices[g_Indices[first + 2]].normal * bary.y);
+	position = ray.Origin + ray.Direction * query.CommittedRayT();
+	const float4 clip = mul(float4(position, 1.0f), g_Frame.viewProj);
+	depth = clip.z / clip.w;
+	return true;
+}
+
 float ComputeAO(int2 pixel)
 {
-	const float4 input = g_Input.Load(int3(pixel, 0));
-	const float depth = input.w;
-	if (!(depth > 0.0f))
+	float3 position;
+	float3 n;
+	float depth;
+	if (!TracePrimary(pixel, position, n, depth))
 	{
+		g_Surface[pixel] = 0.0f;
 		return 1.0f; // background
 	}
-	const float normalLengthSq = dot(input.xyz, input.xyz);
-	if (!(normalLengthSq > 1e-8f))
-	{
-		return 1.0f;
-	}
-	const float3 n = input.xyz * rsqrt(normalLengthSq);
+	g_Surface[pixel] = float4(n, depth);
+
 	// Pushed off the surface so rays never hit the triangle they start on.
-	const float3 origin = ReconstructWorld(float2(pixel) + 0.5f, depth) + n * 2e-3f;
+	const float3 origin = position + n * 2e-3f;
 	const float3 helper = abs(n.y) < 0.99f ? float3(0.0f, 1.0f, 0.0f) : float3(1.0f, 0.0f, 0.0f);
 	const float3 t = normalize(cross(helper, n));
 	const float3 b = cross(n, t);
@@ -51,7 +95,7 @@ float ComputeAO(int2 pixel)
 		ray.TMin = 0.0f;
 		ray.TMax = radius;
 
-		RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> query;
+		SceneQuery query;
 		query.TraceRayInline(g_Scene, RAY_FLAG_NONE, 0xFF, ray);
 		query.Proceed();
 		if (query.CommittedStatus() == COMMITTED_TRIANGLE_HIT)

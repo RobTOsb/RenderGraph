@@ -12,6 +12,7 @@
 #include <fstream>
 #include <memory>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -41,6 +42,9 @@ namespace
 		XMFLOAT3 albedo;
 		float emissive;
 	};
+
+	// The profile scope around the whole graph, on the graphics queue.
+	constexpr const char *kGpuFrameScope = "GPU frame";
 
 	// Matches FrameConstants in common.slang.
 	struct FrameConstants
@@ -217,6 +221,7 @@ namespace
 		windowDesc.title = "Render Graph Sandbox: Cornell box";
 		windowDesc.width = 1280;
 		windowDesc.height = 720;
+		windowDesc.fullscreen = true;
 		Window window(windowDesc);
 
 		std::unique_ptr<RenderContext> rc(CreateRenderContext(&window, RenderAPI::D3D12, kFramesInFlight, 3));
@@ -255,8 +260,8 @@ namespace
 				rc->CreateBuffer(indexBufferDesc, ResourceViewType::ShaderResource, indices.data(), upload);
 		rc->EndUpload(upload);
 
-		// One BLAS and one instance for RTAO, built in the first frame. Like the vertices they never change,
-		// so they stay out of the graph.
+		// One BLAS and one instance for RTAO. The graph builds the BLAS once, in the first RTAO frame, and the TLAS
+		// every frame into a transient buffer, so the TLAS object only holds the instances.
 		BLASGeometry geometry;
 		geometry.vertexBuffer = vertexBuffer;
 		geometry.vertexCount = vertexCount;
@@ -268,7 +273,7 @@ namespace
 		instance.blas = blas;
 		instance.transform[0][0] = instance.transform[1][1] = instance.transform[2][2] = 1.0f;
 		const AccelerationStructureHandle tlas = rc->CreateTLAS(std::span<const TLASInstance>(&instance, 1));
-		const ResourceHandle sceneSRV = rc->GetAccelerationStructureSRV(tlas);
+		const TLASBuildSizes tlasSizes = rc->GetTLASBuildSizes(tlas);
 
 		// One constant buffer per frame in flight, so the CPU never writes one the GPU is reading.
 		std::array<ResourceHandle, kFramesInFlight> frameConstantBuffers;
@@ -289,6 +294,12 @@ namespace
 				"scene.slang",
 				{ { "vsMain", PipelineShaderStage::Vertex }, { "psPrepass", PipelineShaderStage::Pixel } },
 				depthInfo);
+
+		// RTAO traces its own surfaces, so its prepass only writes depth.
+		GraphicsPipelineCreateInfo depthOnlyInfo = depthInfo;
+		depthOnlyInfo.rtvFormats = {};
+		const PipelineHandle depthOnlyPipeline =
+				CreatePipeline(*rc, "scene.slang", { { "vsMain", PipelineShaderStage::Vertex } }, depthOnlyInfo);
 
 		GraphicsPipelineCreateInfo gbufferInfo = depthInfo;
 		gbufferInfo.depthStencilState.depthFunc = D3D12_COMPARISON_FUNC_EQUAL;
@@ -316,127 +327,221 @@ namespace
 				{ { "vsFullscreen", PipelineShaderStage::Vertex }, { "psLighting", PipelineShaderStage::Pixel } },
 				lightingInfo);
 
-		// The graph is built and compiled once; the back buffer import is rebound every frame.
+		// The graph is reset, recorded, compiled and executed every frame, so its passes can follow the UI:
+		// the TLAS build and read are only in it while RTAO is on, and the BLAS build until it has run once.
+		// Compile only does the work when the recording differs from the last one; other frames reuse it.
 		RenderGraph graph;
-		TextureDesc depthDesc = RenderTargetDesc(width, height, Format::R32_TYPELESS, "Depth");
-		depthDesc.clearValue.depth = 0.0f; // reversed Z clears to the far plane at 0
-		const auto depth = graph.CreateTexture(depthDesc);
-		const auto albedo = graph.CreateTexture(RenderTargetDesc(width, height, Format::R8G8B8A8_UNORM, "Albedo"));
-		const auto normal = graph.CreateTexture(RenderTargetDesc(width, height, Format::R16G16B16A16_FLOAT, "Normal"));
-		// Normal and depth for AO, written by the prepass so AO shares nothing with the G-buffer pass.
-		const auto aoInput = graph.CreateTexture(RenderTargetDesc(width, height, Format::R32G32B32A32_FLOAT, "AOInput"));
-		const auto aoRaw = graph.CreateTexture(RenderTargetDesc(width, height, Format::R8_UNORM, "AORaw"));
-		const auto ao = graph.CreateTexture(RenderTargetDesc(width, height, Format::R8_UNORM, "AO"));
-		const auto backBuffer = graph.ImportTexture(rc->GetCurrentBackBufferHandle(), "BackBuffer");
-
-		// Section 1: the prepass. Section 2: the G-buffer on graphics while AO runs on async compute.
-		// Section 3: lighting and the UI, once both are done.
-		graph.AddPass(Pass::Graphics("DepthPrepass")
-							  .Use(depth, Access::DepthStencilWrite)
-							  .Writes(aoInput)
-							  .Executes(
-									  [&](PassContext &ctx)
-									  {
-										  const Resource depthTarget = ctx.GetResource(depth);
-										  const Resource inputTarget = ctx.GetResource(aoInput);
-										  float clear[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-										  ctx.rc.SetRenderTargets(&inputTarget, 1, depthTarget);
-										  ctx.rc.ClearRenderTarget(inputTarget, clear);
-										  ctx.rc.ClearDepthStencil(depthTarget, 0.0f);
-										  BeginDraw(ctx.rc, depthPipeline, frameConstants, width, height);
-										  ctx.rc.SetSRVByName("g_Vertices", vertexBuffer);
-										  ctx.rc.Draw(vertexCount);
-									  }));
-
-		graph.Submit();
-
-		graph.AddPass(Pass::Graphics("GBuffer")
-							  .Use(depth, Access::DepthStencilRead)
-							  .Writes(albedo)
-							  .Writes(normal)
-							  .Executes(
-									  [&](PassContext &ctx)
-									  {
-										  const Resource targets[] = { ctx.GetResource(normal),
-																	   ctx.GetResource(albedo) };
-										  float clear[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-										  ctx.rc.ClearRenderTarget(targets[0], clear);
-										  ctx.rc.ClearRenderTarget(targets[1], clear);
-										  ctx.rc.SetRenderTargets(targets, 2, ctx.GetResource(depth), true);
-										  BeginDraw(ctx.rc, gbufferPipeline, frameConstants, width, height);
-										  ctx.rc.SetSRVByName("g_Vertices", vertexBuffer);
-										  ctx.rc.Draw(vertexCount);
-									  }));
-
-		// SSAO and RTAO read the same input and write the same raw AO, so the checkbox picks one each frame
-		// without recompiling the graph. Setting a pipeline resets its bindings, so everything is bound after it.
+		graph.SetProfilePasses(true); // each pass gets a GPU timestamp scope, shown in the UI
 		bool useRTAO = true;
-		auto dispatchAO = [&](PassContext &ctx, PipelineHandle pipeline, rg::ResourceId output, rg::ResourceId rawAO = {})
+		bool asyncCompute = true; // off puts the AO and acceleration structure passes on the graphics queue
+		bool blasBuilt = false;
+		float compileMilliseconds = 0.0f;
+		uint32_t fullCompiles = 0;
+		auto executeGraph = [&](ResourceHandle currentBackBuffer)
 		{
-			ctx.rc.SetComputePipeline(pipeline);
-			ctx.rc.SetComputeConstantBufferByName("g_Frame", frameConstants);
-			ctx.rc.SetComputeSRVByName("g_Input", ctx.Get(aoInput));
-			if (pipeline == rtaoPipeline)
+			graph.Reset();
+			TextureDesc depthDesc = RenderTargetDesc(width, height, Format::R32_TYPELESS, "Depth");
+			depthDesc.clearValue.depth = 0.0f; // reversed Z clears to the far plane at 0
+			const auto depth = graph.CreateTexture(depthDesc);
+			const auto albedo = graph.CreateTexture(RenderTargetDesc(width, height, Format::R8G8B8A8_UNORM, "Albedo"));
+			const auto normal = graph.CreateTexture(RenderTargetDesc(width, height, Format::R16G16B16A16_FLOAT, "Normal"));
+			// Normal and depth for AO and its blur: written by the prepass for SSAO, and by RTAO's primary rays.
+			const auto aoInput = graph.CreateTexture(
+					RenderTargetDesc(width, height, Format::R32G32B32A32_FLOAT, useRTAO ? "TracedSurface" : "AOInput"));
+			const auto aoRaw = graph.CreateTexture(RenderTargetDesc(width, height, Format::R8_UNORM, "AORaw"));
+			const auto ao = graph.CreateTexture(RenderTargetDesc(width, height, Format::R8_UNORM, "AO"));
+			const auto backBuffer = graph.ImportTexture(currentBackBuffer, "BackBuffer");
+			const QueueType aoQueue = asyncCompute ? QueueType::Compute : QueueType::Graphics;
+
+			// The sections below are laid out for async compute. Without it the aoQueue passes run on graphics in
+			// the same sections, and the graph orders them by their dependencies alone.
+			// SSAO reads the prepass. Section 1: the prepass. Section 2: the G-buffer on graphics while SSAO runs on
+			// async compute. Section 3: lighting and the UI.
+			// RTAO traces its own surfaces, so AO needs nothing from graphics. Section 1: the prepass and G-buffer on
+			// graphics while async compute builds the TLAS (after the BLAS in the first frame), traces and blurs.
+			// Section 2: lighting and the UI.
+			rg::ResourceId sceneTLAS;
+			const bool buildBLAS = useRTAO && !blasBuilt;
+			if (useRTAO)
 			{
-				ctx.rc.SetComputeSRVByName("g_Scene", sceneSRV);
+				// The BLAS keeps its contents, so it is imported. The TLAS and its scratch live for one execution.
+				const auto sceneBLAS = graph.ImportBuffer(rc->GetAccelerationStructureResource(blas), "SceneBLAS");
+				BufferDesc tlasDesc;
+				tlasDesc.sizeInBytes = tlasSizes.resultBytes;
+				tlasDesc.debugName = "SceneTLAS";
+				sceneTLAS = graph.CreateBuffer(tlasDesc, ResourceViewType::ShaderResource);
+				BufferDesc scratchDesc;
+				scratchDesc.sizeInBytes = tlasSizes.scratchBytes;
+				scratchDesc.structureByteStride = sizeof(uint32_t);
+				scratchDesc.debugName = "TLASScratch";
+				const auto tlasScratch = graph.CreateBuffer(scratchDesc);
+				if (buildBLAS)
+				{
+					graph.AddPass(Pass::Compute("BuildBLAS")
+										  .OnQueue(aoQueue)
+										  .Use(sceneBLAS, Access::AccelerationStructureBuildWrite)
+										  .Executes([&](PassContext &ctx) { ctx.rc.BuildAccelerationStructure(blas); }));
+				}
+				graph.AddPass(Pass::Compute("BuildTLAS")
+									  .OnQueue(aoQueue)
+									  .Use(sceneBLAS, Access::AccelerationStructureBuildRead)
+									  .Use(tlasScratch, Access::AccelerationStructureScratch)
+									  .Use(sceneTLAS, Access::AccelerationStructureBuildWrite)
+									  // By value: the scratch id is scoped to this block, and the pass runs after it ends.
+									  .Executes([&, tlasScratch](PassContext &ctx)
+												{ ctx.rc.BuildTLASInto(tlas, ctx.Get(sceneTLAS), ctx.Get(tlasScratch)); }));
 			}
-			if (rawAO.IsValid())
+			Pass prepass = Pass::Graphics("DepthPrepass")
+								   .Use(depth, Access::DepthStencilWrite)
+								   .Executes(
+										   [&](PassContext &ctx)
+										   {
+											   const Resource depthTarget = ctx.GetResource(depth);
+											   if (useRTAO)
+											   {
+												   ctx.rc.SetRenderTargets(nullptr, 0, depthTarget);
+											   }
+											   else
+											   {
+												   const Resource inputTarget = ctx.GetResource(aoInput);
+												   float clear[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+												   ctx.rc.SetRenderTargets(&inputTarget, 1, depthTarget);
+												   ctx.rc.ClearRenderTarget(inputTarget, clear);
+											   }
+											   ctx.rc.ClearDepthStencil(depthTarget, 0.0f);
+											   BeginDraw(ctx.rc,
+														 useRTAO ? depthOnlyPipeline : depthPipeline,
+														 frameConstants,
+														 width,
+														 height);
+											   ctx.rc.SetSRVByName("g_Vertices", vertexBuffer);
+											   ctx.rc.Draw(vertexCount);
+										   });
+			if (!useRTAO)
 			{
-				ctx.rc.SetComputeSRVByName("g_AO", ctx.Get(rawAO));
+				prepass.Writes(aoInput);
 			}
-			ctx.rc.SetComputeUAVByName("g_Out", ctx.Get(output));
-			ctx.rc.Dispatch((width + 7) / 8, (height + 7) / 8, 1);
+			graph.AddPass(std::move(prepass));
+			if (!useRTAO)
+			{
+				graph.Submit();
+			}
+
+			graph.AddPass(Pass::Graphics("GBuffer")
+								  .Use(depth, Access::DepthStencilRead)
+								  .Writes(albedo)
+								  .Writes(normal)
+								  .Executes(
+										  [&](PassContext &ctx)
+										  {
+											  const Resource targets[] = { ctx.GetResource(normal),
+																		   ctx.GetResource(albedo) };
+											  float clear[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+											  ctx.rc.ClearRenderTarget(targets[0], clear);
+											  ctx.rc.ClearRenderTarget(targets[1], clear);
+											  ctx.rc.SetRenderTargets(targets, 2, ctx.GetResource(depth), true);
+											  BeginDraw(ctx.rc, gbufferPipeline, frameConstants, width, height);
+											  ctx.rc.SetSRVByName("g_Vertices", vertexBuffer);
+											  ctx.rc.Draw(vertexCount);
+										  }));
+
+			// SSAO and the blur read the surface in aoInput, which RTAO writes. Setting a pipeline resets its
+			// bindings, so everything is bound after it.
+			auto dispatchAO = [&](PassContext &ctx, PipelineHandle pipeline, rg::ResourceId output, rg::ResourceId rawAO = {})
+			{
+				ctx.rc.SetComputePipeline(pipeline);
+				ctx.rc.SetComputeConstantBufferByName("g_Frame", frameConstants);
+				ctx.rc.SetComputeSRVByName("g_Input", ctx.Get(aoInput));
+				if (rawAO.IsValid())
+				{
+					ctx.rc.SetComputeSRVByName("g_AO", ctx.Get(rawAO));
+				}
+				ctx.rc.SetComputeUAVByName("g_Out", ctx.Get(output));
+				ctx.rc.Dispatch((width + 7) / 8, (height + 7) / 8, 1);
+			};
+			if (useRTAO)
+			{
+				// The vertices and indices never change, so they stay out of the graph like in the raster passes.
+				graph.AddPass(Pass::Compute("RTAO")
+									  .OnQueue(aoQueue)
+									  .Use(sceneTLAS, Access::AccelerationStructureRead)
+									  .Writes(aoInput)
+									  .Writes(aoRaw)
+									  .Executes(
+											  [&](PassContext &ctx)
+											  {
+												  ctx.rc.SetComputePipeline(rtaoPipeline);
+												  ctx.rc.SetComputeConstantBufferByName("g_Frame", frameConstants);
+												  ctx.rc.SetComputeSRVByName("g_Vertices", vertexBuffer);
+												  ctx.rc.SetComputeSRVByName("g_Indices", indexBuffer);
+												  ctx.rc.SetComputeSRVByName("g_Scene", ctx.Get(sceneTLAS));
+												  ctx.rc.SetComputeUAVByName("g_Surface", ctx.Get(aoInput));
+												  ctx.rc.SetComputeUAVByName("g_Out", ctx.Get(aoRaw));
+												  ctx.rc.Dispatch((width + 7) / 8, (height + 7) / 8, 1);
+											  }));
+			}
+			else
+			{
+				graph.AddPass(Pass::Compute("SSAO")
+									  .OnQueue(aoQueue)
+									  .Reads(aoInput)
+									  .Writes(aoRaw)
+									  .Executes([&](PassContext &ctx) { dispatchAO(ctx, ssaoPipeline, aoRaw); }));
+			}
+			graph.AddPass(Pass::Compute("AOBlur")
+								  .OnQueue(aoQueue)
+								  .Reads(aoInput)
+								  .Reads(aoRaw)
+								  .Writes(ao)
+								  .Executes([&](PassContext &ctx) { dispatchAO(ctx, blurPipeline, ao, aoRaw); }));
+			graph.Submit();
+
+			graph.AddPass(Pass::Graphics("Lighting")
+								  .Reads(albedo)
+								  .Reads(normal)
+								  .Reads(depth)
+								  .Reads(ao)
+								  .Writes(backBuffer)
+								  .Executes(
+										  [&](PassContext &ctx)
+										  {
+											  const Resource target = ctx.GetResource(backBuffer);
+											  ctx.rc.SetRenderTargets(&target, 1);
+											  BeginDraw(ctx.rc, lightingPipeline, frameConstants, width, height);
+											  ctx.rc.SetSRVByName("g_Albedo", ctx.Get(albedo));
+											  ctx.rc.SetSRVByName("g_Normal", ctx.Get(normal));
+											  ctx.rc.SetSRVByName("g_Depth", ctx.Get(depth));
+											  ctx.rc.SetSRVByName("g_AO", ctx.Get(ao));
+											  ctx.rc.Draw(3);
+										  }));
+			graph.AddPass(Pass::Graphics("ImGui")
+								  .Use(backBuffer, Access::ColourAttachment)
+								  .Executes(
+										  [&](PassContext &ctx)
+										  {
+											  const Resource target = ctx.GetResource(backBuffer);
+											  ctx.rc.SetRenderTargets(&target, 1);
+											  ctx.rc.ImguiRender();
+										  }));
+
+			const auto compileStart = std::chrono::steady_clock::now();
+			if (!graph.Compile(*rc))
+			{
+				throw std::runtime_error("Render graph failed to compile: " + graph.GetError());
+			}
+			compileMilliseconds =
+					std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - compileStart).count();
+			// A full compile means the graph changed shape, so print it and save it as HTML.
+			if (!graph.WasLastCompileReused())
+			{
+				++fullCompiles;
+				std::printf("%s\n", graph.Dump().c_str());
+				std::ofstream("RenderGraph.html", std::ios::binary) << graph.DumpHtml("Cornell box");
+			}
+			// The pass callbacks capture this scope's resources, so the graph executes before it returns.
+			graph.Execute(*rc);
+			blasBuilt = blasBuilt || buildBLAS;
 		};
-		graph.AddPass(Pass::Compute("AO")
-							  .OnQueue(QueueType::Compute)
-							  .Reads(aoInput)
-							  .Writes(aoRaw)
-							  .Executes([&](PassContext &ctx)
-										{ dispatchAO(ctx, useRTAO ? rtaoPipeline : ssaoPipeline, aoRaw); }));
-		graph.AddPass(Pass::Compute("AOBlur")
-							  .OnQueue(QueueType::Compute)
-							  .Reads(aoInput)
-							  .Reads(aoRaw)
-							  .Writes(ao)
-							  .Executes([&](PassContext &ctx) { dispatchAO(ctx, blurPipeline, ao, aoRaw); }));
-		graph.Submit();
-
-		graph.AddPass(Pass::Graphics("Lighting")
-							  .Reads(albedo)
-							  .Reads(normal)
-							  .Reads(depth)
-							  .Reads(ao)
-							  .Writes(backBuffer)
-							  .Executes(
-									  [&](PassContext &ctx)
-									  {
-										  const Resource target = ctx.GetResource(backBuffer);
-										  ctx.rc.SetRenderTargets(&target, 1);
-										  BeginDraw(ctx.rc, lightingPipeline, frameConstants, width, height);
-										  ctx.rc.SetSRVByName("g_Albedo", ctx.Get(albedo));
-										  ctx.rc.SetSRVByName("g_Normal", ctx.Get(normal));
-										  ctx.rc.SetSRVByName("g_Depth", ctx.Get(depth));
-										  ctx.rc.SetSRVByName("g_AO", ctx.Get(ao));
-										  ctx.rc.Draw(3);
-									  }));
-		graph.AddPass(Pass::Graphics("ImGui")
-							  .Use(backBuffer, Access::ColourAttachment)
-							  .Executes(
-									  [&](PassContext &ctx)
-									  {
-										  const Resource target = ctx.GetResource(backBuffer);
-										  ctx.rc.SetRenderTargets(&target, 1);
-										  ctx.rc.ImguiRender();
-									  }));
-
-		if (!graph.Compile(*rc))
-		{
-			std::fprintf(stderr, "Render graph failed to compile: %s\n", graph.GetError().c_str());
-			return 1;
-		}
-		
-		std::printf("%s\n", graph.Dump().c_str());
-		std::ofstream("RenderGraph.html", std::ios::binary) << graph.DumpHtml("Cornell box");
 
 		Camera camera;
 		FrameConstants constants = {};
@@ -453,6 +558,13 @@ namespace
 		uint64_t frame = 0;
 		bool autoRotate = false;
 		auto lastTime = std::chrono::steady_clock::now();
+		// Frame time and FPS over half second windows, so the numbers are readable; the worst frame shows hitches.
+		float windowSeconds = 0.0f;
+		float windowWorstSeconds = 0.0f;
+		uint32_t windowFrames = 0;
+		float frameMilliseconds = 0.0f;
+		float worstFrameMilliseconds = 0.0f;
+		float framesPerSecond = 0.0f;
 		try
 		{
 			while (window.ProcessEvents())
@@ -483,6 +595,18 @@ namespace
 				const auto now = std::chrono::steady_clock::now();
 				const float deltaSeconds = std::chrono::duration<float>(now - lastTime).count();
 				lastTime = now;
+				windowSeconds += deltaSeconds;
+				windowWorstSeconds = std::max(windowWorstSeconds, deltaSeconds);
+				++windowFrames;
+				if (windowSeconds >= 0.5f)
+				{
+					frameMilliseconds = windowSeconds * 1000.0f / static_cast<float>(windowFrames);
+					worstFrameMilliseconds = windowWorstSeconds * 1000.0f;
+					framesPerSecond = static_cast<float>(windowFrames) / windowSeconds;
+					windowSeconds = 0.0f;
+					windowWorstSeconds = 0.0f;
+					windowFrames = 0;
+				}
 				if (autoRotate)
 				{
 					camera.yaw += deltaSeconds * 0.4f;
@@ -496,8 +620,60 @@ namespace
 				rc->ImguiNewFrame();
 				ImGui::SetNextWindowPos(ImVec2(16.0f, 16.0f), ImGuiCond_FirstUseEver);
 				ImGui::Begin("Ambient occlusion", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
+				ImGui::Text("%.1f fps, %.3f ms a frame (worst %.3f ms)", framesPerSecond, frameMilliseconds, worstFrameMilliseconds);
+				// The graphics queue from the first pass to the last, waits for async compute included.
+				const GPUProfileScopeStats *gpuFrame = rc->GetProfileScopeStats(kGpuFrameScope);
+				ImGui::Text("GPU frame %.3f ms (worst %.3f ms)",
+							gpuFrame ? gpuFrame->averageMs : 0.0f,
+							gpuFrame ? gpuFrame->maxMs : 0.0f);
+				ImGui::Separator();
 				ImGui::Checkbox("Ray traced (RTAO)", &useRTAO);
 				ImGui::TextUnformatted(useRTAO ? "8 rays per pixel against the scene TLAS" : "16 depth buffer samples per pixel");
+				ImGui::Checkbox("Async compute", &asyncCompute);
+				ImGui::TextUnformatted(asyncCompute ? "AO and the TLAS build overlap the raster passes"
+													: "Every pass runs on the graphics queue");
+				ImGui::Separator();
+				ImGui::Text("Render graph: %u batches, %s in %.3f ms",
+							graph.GetTotalBatchCount(),
+							graph.WasLastCompileReused() ? "reused" : "compiled",
+							compileMilliseconds);
+				ImGui::Text("Full compiles so far: %u", fullCompiles);
+
+				// GPU time of each pass, averaged over recent frames. Async compute overlaps graphics, so the
+				// queue totals are busy time, not frame time.
+				ImGui::Separator();
+				const std::vector<rg::PassTiming> timings = graph.GetPassTimings(*rc);
+				float queueTotals[2] = {};
+				if (ImGui::BeginTable("GPU timings", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit))
+				{
+					ImGui::TableSetupColumn("Pass");
+					ImGui::TableSetupColumn("Queue");
+					ImGui::TableSetupColumn("Avg ms");
+					ImGui::TableSetupColumn("Max ms");
+					ImGui::TableHeadersRow();
+					for (const rg::PassTiming &timing: timings)
+					{
+						ImGui::TableNextRow();
+						ImGui::TableNextColumn();
+						ImGui::TextUnformatted(timing.name.c_str());
+						ImGui::TableNextColumn();
+						ImGui::TextUnformatted(timing.queue == QueueType::Compute ? "Compute" : "Graphics");
+						ImGui::TableNextColumn();
+						if (timing.stats.sampleCount == 0)
+						{
+							ImGui::TextUnformatted("-");
+							ImGui::TableNextColumn();
+							ImGui::TextUnformatted("-");
+							continue;
+						}
+						ImGui::Text("%.3f", timing.stats.averageMs);
+						ImGui::TableNextColumn();
+						ImGui::Text("%.3f", timing.stats.maxMs);
+						queueTotals[timing.queue == QueueType::Compute ? 1 : 0] += timing.stats.averageMs;
+					}
+					ImGui::EndTable();
+				}
+				ImGui::Text("Graphics busy %.3f ms, compute busy %.3f ms", queueTotals[0], queueTotals[1]);
 				ImGui::End();
 
 				// BeginFrame waits for this slot's previous frame, so its constant buffer is free to write.
@@ -506,18 +682,11 @@ namespace
 				rc->UpdateConstantBuffer(frameConstants, &constants, sizeof(constants));
 				rc->BeginGraphicsCommandList();
 				rc->SetDescriptorHeaps();
-				if (frame == 0)
-				{
-					// Recorded before the prepass, whose submit the compute queue waits on before tracing.
-					rc->BuildAccelerationStructure(blas);
-					rc->UAVBarrierForAccelerationStructures();
-					rc->BuildAccelerationStructure(tlas);
-					rc->UAVBarrierForAccelerationStructures();
-				}
 
 				const ResourceHandle currentBackBuffer = rc->GetCurrentBackBufferHandle();
-				graph.RebindImport(backBuffer, currentBackBuffer);
-				graph.Execute(*rc);
+				rc->BeginProfileScope(kGpuFrameScope);
+				executeGraph(currentBackBuffer);
+				rc->EndProfileScope();
 				rc->TransitionResource(currentBackBuffer,
 									   ResourceLayout::Present,
 									   ResourceSync::None,

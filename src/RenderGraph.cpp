@@ -32,7 +32,7 @@ namespace rg
 			kBufferOnly = 1 << 2,
 			kComputeQueue = 1 << 3, // also allowed on the compute queue
 			kUnorderedAccess = 1 << 4, // transient resources need ALLOW_UNORDERED_ACCESS
-			kAccelerationStructure = 1 << 5, // the buffer must be an acceleration structure, so imported
+			kAccelerationStructure = 1 << 5, // the buffer holds an acceleration structure
 		};
 
 		struct AccessInfo
@@ -514,6 +514,27 @@ namespace rg
 		++currentSection_;
 	}
 
+	void RenderGraph::Reset()
+	{
+		// A compiled graph waits aside, with its schedule and barriers, until Compile sees whether it still fits.
+		stashed_ = compiled_;
+		if (stashed_)
+		{
+			std::swap(stashedResources_, resources_);
+			std::swap(stashedPasses_, passes_);
+			compiled_ = false;
+			error_.clear();
+		}
+		else
+		{
+			ResetCompiledState();
+		}
+		resources_.clear();
+		passes_.clear();
+		currentSection_ = kFirstUserSection;
+		trace_.clear();
+	}
+
 	// Compile
 
 	void RenderGraph::ResetCompiledState()
@@ -549,10 +570,15 @@ namespace rg
 
 	bool RenderGraph::Compile(RenderContext &rc, const CompileOptions &options)
 	{
-		if (realisedContext_)
+		CaptureDeclarations(rc, options, declarations_);
+		lastCompileReused_ = stashed_ && hasCompiledDeclarations_ && SameDeclarations(declarations_, compiledDeclarations_);
+		if (lastCompileReused_)
 		{
-			return Fail("Compile: call ReleaseResources() (with the GPU idle) before recompiling an executed graph");
+			ReuseStashedCompile();
+			return true;
 		}
+		stashed_ = false;
+		hasCompiledDeclarations_ = false;
 
 		ResetCompiledState();
 		// Prologue, user sections, epilogue.
@@ -582,18 +608,79 @@ namespace rg
 			OptimizeLifetimes();
 		}
 		BuildBatches(options);
+		AddDataWaits();
 		PlaceTransientMemory(options.aliasTransientMemory);
 		BuildBarriersAndSyncs();
 		FinaliseQueueWaits();
 
 		compiled_ = true;
+		std::swap(compiledDeclarations_, declarations_);
+		hasCompiledDeclarations_ = true;
 		return true;
+	}
+
+	void RenderGraph::CaptureDeclarations(RenderContext &rc,
+										  const CompileOptions &options,
+										  Declarations &declarations) const
+	{
+		declarations.resources.resize(resources_.size());
+		for (size_t r = 0; r < resources_.size(); ++r)
+		{
+			const ResourceNode &node = resources_[r];
+			DeclaredResource &declared = declarations.resources[r];
+			declared.name = node.name;
+			declared.imported = node.imported;
+			declared.isTexture = node.isTexture;
+			declared.bufferDesc = node.bufferDesc;
+			declared.textureDesc = node.textureDesc;
+			declared.viewType = node.viewType;
+			declared.parent = node.parent;
+			declared.mip = node.mip;
+			declared.importedMipLevels =
+					node.imported && node.parent == kNoNode && !node.mips.empty() ? rc.GetTextureDesc(node.handle).mipLevels : 0;
+		}
+		declarations.passes.resize(passes_.size());
+		for (size_t p = 0; p < passes_.size(); ++p)
+		{
+			const PassNode &pass = passes_[p];
+			DeclaredPass &declared = declarations.passes[p];
+			declared.name = pass.desc.name;
+			declared.kind = pass.desc.kind;
+			declared.queue = pass.desc.queue;
+			declared.section = pass.section;
+			declared.attachments = pass.desc.attachments;
+		}
+		declarations.sectionCount = currentSection_;
+		declarations.options = options;
+	}
+
+	void RenderGraph::ReuseStashedCompile()
+	{
+		// Mip nodes the compile added come after the recorded resources, so recorded indices match.
+		for (size_t p = 0; p < passes_.size(); ++p)
+		{
+			stashedPasses_[p].desc.execute = std::move(passes_[p].desc.execute);
+		}
+		for (size_t r = 0; r < resources_.size(); ++r)
+		{
+			if (resources_[r].imported && resources_[r].parent == kNoNode)
+			{
+				stashedResources_[r].handle = resources_[r].handle;
+			}
+		}
+		std::swap(resources_, stashedResources_);
+		std::swap(passes_, stashedPasses_);
+		stashed_ = false;
+		compiled_ = true;
+		error_.clear();
 	}
 
 	bool RenderGraph::BuildTimelines()
 	{
 		// Section and queue each memory owner was last used on, to keep one owner off two queues at once.
 		std::vector<std::pair<uint32_t, QueueType>> lastUse(resources_.size(), { UINT32_MAX, QueueType::Graphics });
+		// The first pass to use each transient buffer as an acceleration structure, and the first to use it otherwise.
+		std::vector<std::pair<uint32_t, uint32_t>> structureUse(resources_.size(), { UINT32_MAX, UINT32_MAX });
 
 		for (uint32_t passIndex = 0; passIndex < passes_.size(); ++passIndex)
 		{
@@ -638,10 +725,11 @@ namespace rg
 				{
 					return Fail("pass '" + desc.name + "' uses texture '" + node.name + "' as " + ToString(access));
 				}
-				if (HasFlag(access, kAccelerationStructure) && !node.imported)
+				if (!node.imported && !node.isTexture)
 				{
-					return Fail("pass '" + desc.name + "' uses transient '" + node.name + "' as " + ToString(access) +
-								"; acceleration structures come from the RenderContext, so import them");
+					uint32_t &first = HasFlag(access, kAccelerationStructure) ? structureUse[r].first
+																			   : structureUse[r].second;
+					first = std::min(first, passIndex);
 				}
 				if (!IsAccessAllowedOnQueue(access, desc.queue))
 				{
@@ -674,6 +762,11 @@ namespace rg
 						if (access == Access::DepthStencilWrite || access == Access::DepthStencilRead)
 							usage = usage | ResourceUsageFlags::DepthStencil;
 					}
+					else if (HasFlag(access, kAccelerationStructure))
+					{
+						ownerNode.bufferDesc.usageFlags =
+								ownerNode.bufferDesc.usageFlags | ResourceUsageFlags::AccelerationStructure;
+					}
 					else if (HasFlag(access, kUnorderedAccess) ||
 							 ownerNode.viewType == ResourceViewType::UnorderedAccess)
 					{
@@ -695,6 +788,27 @@ namespace rg
 						return false;
 					}
 				}
+			}
+		}
+
+		// A buffer made for an acceleration structure can't take other accesses, and its one view traces it.
+		for (uint32_t r = 0; r < resources_.size(); ++r)
+		{
+			const auto [structurePass, otherPass] = structureUse[r];
+			if (structurePass == UINT32_MAX)
+			{
+				continue;
+			}
+			if (otherPass != UINT32_MAX)
+			{
+				return Fail("transient '" + resources_[r].name + "' is an acceleration structure in pass '" +
+							passes_[structurePass].desc.name + "' and a plain buffer in pass '" +
+							passes_[otherPass].desc.name + "'");
+			}
+			if (resources_[r].viewType != ResourceViewType::ShaderResource)
+			{
+				return Fail("transient acceleration structure '" + resources_[r].name +
+							"' needs a ShaderResource view, which is the view rays trace");
 			}
 		}
 		return true;
@@ -1012,8 +1126,49 @@ namespace rg
 		}
 	}
 
+	void RenderGraph::AddDataWaits()
+	{
+		const uint32_t epilogue = GetEpilogueSection();
+		for (const ResourceNode &node: resources_)
+		{
+			if (node.timeline.empty())
+			{
+				continue;
+			}
+			const AccessGroup &first = groups_[node.timeline.front()];
+			if (node.imported && first.queue != QueueType::Graphics)
+			{
+				AddQueueWait(first.queue, first.section, QueueType::Graphics, kPrologueSection);
+			}
+			for (uint32_t i = 1; i < node.timeline.size(); ++i)
+			{
+				const AccessGroup &previous = groups_[node.timeline[i - 1]];
+				const AccessGroup &group = groups_[node.timeline[i]];
+				if (previous.queue != group.queue)
+				{
+					AddQueueWait(group.queue, group.section, previous.queue, previous.section);
+				}
+			}
+			const AccessGroup &last = groups_[node.timeline.back()];
+			if (node.imported && last.queue != QueueType::Graphics)
+			{
+				AddQueueWait(QueueType::Graphics, epilogue, last.queue, last.section);
+			}
+		}
+	}
+
 	void RenderGraph::PlaceTransientMemory(bool alias)
 	{
+		// The queue and section of an owner's first and last use, over its mips too. One owner is never on both
+		// queues in a section, so the section decides the queue.
+		struct QueueUse
+		{
+			QueueType queue = QueueType::Graphics;
+			uint32_t section = 0;
+		};
+		std::vector<QueueUse> firstUse(resources_.size());
+		std::vector<QueueUse> lastUse(resources_.size());
+
 		std::vector<uint32_t> transients;
 		for (uint32_t r = 0; r < resources_.size(); ++r)
 		{
@@ -1024,7 +1179,69 @@ namespace rg
 			}
 			std::tie(node.firstBatch, node.lastBatch) = ComputeLifetime(node);
 			transients.push_back(r);
+
+			firstUse[r].section = UINT32_MAX;
+			auto addUses = [&](const ResourceNode &user)
+			{
+				if (user.timeline.empty())
+				{
+					return;
+				}
+				const AccessGroup &first = groups_[user.timeline.front()];
+				const AccessGroup &last = groups_[user.timeline.back()];
+				if (first.section < firstUse[r].section)
+				{
+					firstUse[r] = { first.queue, first.section };
+				}
+				if (last.section >= lastUse[r].section)
+				{
+					lastUse[r] = { last.queue, last.section };
+				}
+			};
+			addUses(node);
+			for (uint32_t m: node.mips)
+			{
+				addUses(resources_[m]);
+			}
 		}
+
+		// waitedThrough[waiting][signalling][section]: the latest submit of the signalling queue the waiting queue
+		// has waited for by the start of that section, or -1.
+		const uint32_t sectionCount = static_cast<uint32_t>(sections_.size());
+		std::vector<int64_t> waitedThrough[kQueueTypeCount][kQueueTypeCount];
+		for (auto &row: waitedThrough)
+		{
+			for (std::vector<int64_t> &sections: row)
+			{
+				sections.assign(sectionCount, -1);
+			}
+		}
+		for (const QueueWaitInfo &wait: pendingWaits_)
+		{
+			int64_t &through =
+					waitedThrough[QueueIndex(wait.waitingQueue)][QueueIndex(wait.signalQueue)][wait.waitingSection];
+			through = std::max<int64_t>(through, wait.signalSection);
+		}
+		for (auto &row: waitedThrough)
+		{
+			for (std::vector<int64_t> &sections: row)
+			{
+				for (uint32_t s = 1; s < sectionCount; ++s)
+				{
+					sections[s] = std::max(sections[s], sections[s - 1]);
+				}
+			}
+		}
+
+		// Memory passes to a later resource without a new wait if both are on one queue, or the later one's queue
+		// already waits for the earlier one's last submit. Otherwise the reuse alone would serialise the queues.
+		auto handsOverFreely = [&](uint32_t earlier, uint32_t later)
+		{
+			const QueueUse &from = lastUse[earlier];
+			const QueueUse &to = firstUse[later];
+			return from.queue == to.queue || waitedThrough[QueueIndex(to.queue)][QueueIndex(from.queue)][to.section] >=
+													 static_cast<int64_t>(from.section);
+		};
 
 		// Mips share their texture's placement, so the barrier code finds them like any other occupant.
 		auto copyToMips = [this, &transients]()
@@ -1077,12 +1294,16 @@ namespace rg
 		{
 			ResourceNode &node = resources_[r];
 
-			// Placed resources whose lifetime rectangles share a batch with this one, by offset.
+			// Placed resources whose lifetime rectangles share a batch with this one, or that could only hand
+			// their memory over with a new queue wait, by offset.
 			std::vector<uint32_t> conflicts;
 			for (uint32_t other: placed)
 			{
 				const ResourceNode &o = resources_[other];
-				if (o.firstBatch <= node.lastBatch && node.firstBatch <= o.lastBatch)
+				const bool overlap = o.firstBatch <= node.lastBatch && node.firstBatch <= o.lastBatch;
+				const bool needsWait = !overlap && (o.lastBatch < node.firstBatch ? !handsOverFreely(other, r)
+																				  : !handsOverFreely(r, other));
+				if (overlap || needsWait)
 				{
 					conflicts.push_back(other);
 				}
@@ -1159,7 +1380,6 @@ namespace rg
 								sections_[kPrologueSection].queues[QueueIndex(QueueType::Graphics)].releases.push_back(
 										{ id, BarrierKind::QueueRelease, {}, released, true });
 							}
-							AddQueueWait(group.queue, group.section, QueueType::Graphics, kPrologueSection);
 							target.barriers.push_back({ id, BarrierKind::QueueAcquire, released, group.state });
 						}
 					}
@@ -1186,6 +1406,8 @@ namespace rg
 							}
 							else
 							{
+								// Placement only shares memory across queues that already wait, so this adds
+								// nothing new; it stays so the barrier is safe whatever placement decided.
 								AddQueueWait(group.queue, group.section, otherLast.queue, otherLast.section);
 							}
 						}
@@ -1223,7 +1445,6 @@ namespace rg
 						sections_[previous.section].queues[QueueIndex(previous.queue)].releases.push_back(
 								{ id, BarrierKind::QueueRelease, previousState, released });
 					}
-					AddQueueWait(group.queue, group.section, previous.queue, previous.section);
 					target.barriers.push_back({ id, BarrierKind::QueueAcquire, released, group.state });
 				}
 				previousState = group.state;
@@ -1239,7 +1460,6 @@ namespace rg
 					sections_[last.section].queues[QueueIndex(last.queue)].releases.push_back(
 							{ id, BarrierKind::QueueRelease, previousState, released });
 				}
-				AddQueueWait(QueueType::Graphics, epilogue, last.queue, last.section);
 				finalState[r] = released;
 			}
 		}
@@ -1344,32 +1564,230 @@ namespace rg
 
 	// Execute
 
-	void RenderGraph::CreateTransientResources(RenderContext &rc)
+	namespace
 	{
-		if (transientMemorySize_ > 0)
+		bool SameTexture(const TextureDesc &a, const TextureDesc &b)
 		{
-			heap_ = rc.CreateMemoryHeap(transientMemorySize_, "RenderGraphTransientHeap");
+			return a.dimension == b.dimension && a.width == b.width && a.height == b.height &&
+				   a.depthOrArraySize == b.depthOrArraySize && a.mipLevels == b.mipLevels && a.format == b.format &&
+				   a.usageFlags == b.usageFlags && a.initialLayout == b.initialLayout &&
+				   std::equal(std::begin(a.clearValue.colour), std::end(a.clearValue.colour), std::begin(b.clearValue.colour)) &&
+				   a.clearValue.depth == b.clearValue.depth && a.debugName == b.debugName;
 		}
-		for (ResourceNode &node: resources_)
+
+		bool SameBuffer(const BufferDesc &a, const BufferDesc &b)
 		{
-			if (!OwnsTransientMemory(node))
+			return a.sizeInBytes == b.sizeInBytes && a.structureByteStride == b.structureByteStride &&
+				   a.usageFlags == b.usageFlags && a.initialLayout == b.initialLayout && a.debugName == b.debugName;
+		}
+	} // namespace
+
+	bool RenderGraph::SameDeclarations(const Declarations &a, const Declarations &b)
+	{
+		if (a.sectionCount != b.sectionCount || !(a.options == b.options) || a.resources.size() != b.resources.size() ||
+			a.passes.size() != b.passes.size())
+		{
+			return false;
+		}
+		for (size_t r = 0; r < a.resources.size(); ++r)
+		{
+			const DeclaredResource &x = a.resources[r];
+			const DeclaredResource &y = b.resources[r];
+			if (x.imported != y.imported || x.isTexture != y.isTexture || x.viewType != y.viewType || x.parent != y.parent ||
+				x.mip != y.mip || x.importedMipLevels != y.importedMipLevels || x.name != y.name ||
+				!SameBuffer(x.bufferDesc, y.bufferDesc) || !SameTexture(x.textureDesc, y.textureDesc))
 			{
-				continue;
+				return false;
 			}
-			if (node.isTexture)
+		}
+		for (size_t p = 0; p < a.passes.size(); ++p)
+		{
+			const DeclaredPass &x = a.passes[p];
+			const DeclaredPass &y = b.passes[p];
+			if (x.kind != y.kind || x.queue != y.queue || x.section != y.section || x.name != y.name ||
+				x.attachments.size() != y.attachments.size())
 			{
-				TextureDesc desc = node.textureDesc;
-				desc.debugName = node.name;
-				node.handle = rc.CreatePlacedTexture(heap_, node.offset, desc, node.viewType);
+				return false;
+			}
+			for (size_t i = 0; i < x.attachments.size(); ++i)
+			{
+				const Attachment &u = x.attachments[i];
+				const Attachment &v = y.attachments[i];
+				if (u.resource.index != v.resource.index || u.access != v.access || u.concurrent != v.concurrent)
+				{
+					return false;
+				}
+			}
+		}
+		return true;
+	}
+
+	namespace
+	{
+	} // namespace
+
+	void RenderGraph::TakeViews(ResourceHandle texture, RetiredObjects &objects)
+	{
+		for (auto it = views_.begin(); it != views_.end();)
+		{
+			if (it->texture == texture)
+			{
+				objects.resources.push_back(it->view);
+				it = views_.erase(it);
 			}
 			else
 			{
-				BufferDesc desc = node.bufferDesc;
-				desc.debugName = node.name;
-				node.handle = rc.CreatePlacedBuffer(heap_, node.offset, desc, node.viewType);
+				++it;
 			}
 		}
+	}
+
+	void RenderGraph::Retire(RenderContext &rc, RetiredObjects objects)
+	{
+		if (objects.resources.empty() && objects.heap == InvalidMemoryHeapHandle)
+		{
+			return;
+		}
+		// An open list holds work the next submit will cover, so wait for that one too.
+		for (uint32_t q = 0; q < kQueueTypeCount; ++q)
+		{
+			const QueueType queue = static_cast<QueueType>(q);
+			objects.syncPoints[q] = rc.GetLastSyncPoint(queue);
+			objects.syncPoints[q].value += rc.IsQueueCommandListOpen(queue) ? 1 : 0;
+		}
+		retired_.push_back(std::move(objects));
+	}
+
+	void RenderGraph::DestroyRetired(RenderContext &rc, bool all)
+	{
+		for (auto it = retired_.begin(); it != retired_.end();)
+		{
+			const bool done = all || std::all_of(std::begin(it->syncPoints),
+												 std::end(it->syncPoints),
+												 [&rc](const QueueSyncPoint &point) { return rc.IsSyncPointComplete(point); });
+			if (!done)
+			{
+				++it;
+				continue;
+			}
+			for (ResourceHandle resource: it->resources)
+			{
+				rc.DestroyResource(resource);
+			}
+			if (it->heap != InvalidMemoryHeapHandle)
+			{
+				rc.DestroyMemoryHeap(it->heap);
+			}
+			it = retired_.erase(it);
+		}
+	}
+
+	void RenderGraph::RealiseResources(RenderContext &rc)
+	{
+		assert(!realisedContext_ || realisedContext_ == &rc);
 		realisedContext_ = &rc;
+		++executions_;
+		DestroyRetired(rc, false);
+
+		// A bigger heap replaces the old one, with everything placed in it.
+		if (transientMemorySize_ > heapSize_)
+		{
+			RetiredObjects old;
+			std::erase_if(placed_,
+						  [&](const PlacedResource &placed)
+						  {
+							  if (placed.committed)
+							  {
+								  return false;
+							  }
+							  TakeViews(placed.handle, old);
+							  old.resources.push_back(placed.handle);
+							  return true;
+						  });
+			old.heap = heap_;
+			Retire(rc, std::move(old));
+			heap_ = rc.CreateMemoryHeap(transientMemorySize_, "RenderGraphTransientHeap");
+			heapSize_ = transientMemorySize_;
+		}
+
+		std::vector<bool> claimed(placed_.size(), false);
+		for (ResourceNode &node: resources_)
+		{
+			const bool committed = IsCommittedTransient(node);
+			if (!OwnsTransientMemory(node) && !committed)
+			{
+				continue;
+			}
+			TextureDesc textureDesc = node.textureDesc;
+			BufferDesc bufferDesc = node.bufferDesc;
+			textureDesc.debugName = node.name;
+			bufferDesc.debugName = node.name;
+			size_t match = 0;
+			for (; match < placed_.size(); ++match)
+			{
+				const PlacedResource &placed = placed_[match];
+				if (!claimed[match] && placed.isTexture == node.isTexture && placed.committed == committed &&
+					(committed || placed.offset == node.offset) && placed.viewType == node.viewType &&
+					(node.isTexture ? SameTexture(placed.textureDesc, textureDesc) : SameBuffer(placed.bufferDesc, bufferDesc)))
+				{
+					break;
+				}
+			}
+			if (match == placed_.size())
+			{
+				PlacedResource placed;
+				placed.isTexture = node.isTexture;
+				placed.textureDesc = textureDesc;
+				placed.bufferDesc = bufferDesc;
+				placed.viewType = node.viewType;
+				placed.offset = node.offset;
+				placed.committed = committed;
+				if (committed)
+				{
+					placed.handle = rc.CreateBuffer(bufferDesc, node.viewType);
+				}
+				else
+				{
+					placed.handle = node.isTexture ? rc.CreatePlacedTexture(heap_, node.offset, textureDesc, node.viewType)
+												   : rc.CreatePlacedBuffer(heap_, node.offset, bufferDesc, node.viewType);
+				}
+				placed_.push_back(std::move(placed));
+				claimed.push_back(false);
+			}
+			claimed[match] = true;
+			placed_[match].lastUsed = executions_;
+			node.handle = placed_[match].handle;
+		}
+
+		// Keep what went unused for a while, since the next frames may want it back; retire the rest.
+		RetiredObjects stale;
+		for (size_t i = 0; i < placed_.size();)
+		{
+			if (!claimed[i] && placed_[i].lastUsed + kRetireAfterUnusedExecutions < executions_)
+			{
+				TakeViews(placed_[i].handle, stale);
+				stale.resources.push_back(placed_[i].handle);
+				placed_.erase(placed_.begin() + static_cast<std::ptrdiff_t>(i));
+				claimed.erase(claimed.begin() + static_cast<std::ptrdiff_t>(i));
+			}
+			else
+			{
+				++i;
+			}
+		}
+		for (auto it = views_.begin(); it != views_.end();)
+		{
+			if (it->lastUsed + kRetireAfterUnusedExecutions < executions_)
+			{
+				stale.resources.push_back(it->view);
+				it = views_.erase(it);
+			}
+			else
+			{
+				++it;
+			}
+		}
+		Retire(rc, std::move(stale));
 	}
 
 	void RenderGraph::ReleaseResources()
@@ -1378,31 +1796,32 @@ namespace rg
 		{
 			return;
 		}
+		RenderContext &rc = *realisedContext_;
+		DestroyRetired(rc, true);
 		// Views before the textures they view.
-		for (ResourceNode &node: resources_)
+		for (const CachedView &view: views_)
 		{
-			for (const TextureViews &view: node.views)
-			{
-				if (view.srv != InvalidResourceHandle)
-					realisedContext_->DestroyResource(view.srv);
-				if (view.uav != InvalidResourceHandle)
-					realisedContext_->DestroyResource(view.uav);
-			}
-			node.views.clear();
+			rc.DestroyResource(view.view);
 		}
+		views_.clear();
+		for (const PlacedResource &placed: placed_)
+		{
+			rc.DestroyResource(placed.handle);
+		}
+		placed_.clear();
 		for (ResourceNode &node: resources_)
 		{
-			if (!node.imported && node.handle != InvalidResourceHandle)
+			if (!node.imported)
 			{
-				realisedContext_->DestroyResource(node.handle);
 				node.handle = InvalidResourceHandle;
 			}
 		}
 		if (heap_ != InvalidMemoryHeapHandle)
 		{
-			realisedContext_->DestroyMemoryHeap(heap_);
+			rc.DestroyMemoryHeap(heap_);
 			heap_ = InvalidMemoryHeapHandle;
 		}
+		heapSize_ = 0;
 		realisedContext_ = nullptr;
 	}
 
@@ -1452,11 +1871,7 @@ namespace rg
 		{
 			throw std::logic_error("RenderGraph::Execute: the graphics command list must be open");
 		}
-		if (!realisedContext_)
-		{
-			CreateTransientResources(rc);
-		}
-		assert(realisedContext_ == &rc);
+		RealiseResources(rc);
 
 		// Read once up front, since mip barriers update the one tracked state as they go.
 		for (ResourceNode &node: resources_)
@@ -1482,10 +1897,11 @@ namespace rg
 		bool dirty[kQueueTypeCount] = { true, false };
 		std::vector<std::array<QueueSyncPoint, kQueueTypeCount>> signals(sections_.size());
 
-		if (usesComputeQueue_)
+		if (usesComputeQueue_ || lastExecuteUsedCompute_)
 		{
-			// Transient memory, and the queue each imported resource is on, carry over between executions.
-			// Each queue waits for the other's work from the previous one; that is usually long finished.
+			// Transient memory, and the queue each imported resource is on, carry over between executions,
+			// even when a recompile changed the graph. Each queue waits for the other's work from the
+			// previous one; that is usually long finished.
 			const QueueSyncPoint lastGraphics = rc.GetLastSyncPoint(QueueType::Graphics);
 			const QueueSyncPoint lastCompute = rc.GetLastSyncPoint(QueueType::Compute);
 			rc.QueueWait(QueueType::Compute, lastGraphics);
@@ -1540,11 +1956,19 @@ namespace rg
 					{
 						const PassNode &pass = passes_[passId.index];
 						rc.BeginEvent(pass.desc.name);
+						if (profilePasses_)
+						{
+							rc.BeginProfileScope(pass.desc.name);
+						}
 						if (pass.desc.execute)
 						{
 							PassContext context(rc, *this, passId);
 							pass.desc.execute(context);
 							rc.SetRecordingQueue(queue);
+						}
+						if (profilePasses_)
+						{
+							rc.EndProfileScope();
 						}
 						rc.EndEvent();
 						traceEvent(ExecutionEventType::Pass, queue, s)->pass = passId;
@@ -1569,6 +1993,7 @@ namespace rg
 			rc.SubmitQueue(QueueType::Compute);
 			traceEvent(ExecutionEventType::Submit, QueueType::Compute, GetEpilogueSection());
 		}
+		lastExecuteUsedCompute_ = usesComputeQueue_;
 		if (!rc.IsQueueCommandListOpen(QueueType::Graphics))
 		{
 			rc.BeginQueueCommandList(QueueType::Graphics);
@@ -1676,34 +2101,70 @@ namespace rg
 		const bool isMip = node.parent != kNoNode;
 		const ResourceHandle texture = resources_[Owner(resource)].handle;
 		assert(texture != InvalidResourceHandle);
-		auto it = std::find_if(node.views.begin(),
-							   node.views.end(),
-							   [&](const TextureViews &v) { return v.texture == texture; });
-		if (it == node.views.end())
-		{
-			node.views.push_back({ texture });
-			it = node.views.end() - 1;
-		}
-		ResourceHandle &view = unorderedAccess ? it->uav : it->srv;
-		if (view == InvalidResourceHandle)
+		const uint32_t baseMip = isMip ? node.mip : 0; // a whole texture's UAV is of mip 0
+		const uint32_t mipCount = isMip ? 1 : 0;
+		auto it = std::find_if(views_.begin(),
+							   views_.end(),
+							   [&](const CachedView &v)
+							   {
+								   return v.texture == texture && v.baseMip == baseMip && v.mipCount == mipCount &&
+										  v.unorderedAccess == unorderedAccess;
+							   });
+		if (it == views_.end())
 		{
 			const TextureDesc desc = rc.GetTextureDesc(texture);
 			TextureViewDesc viewDesc;
 			viewDesc.viewType = unorderedAccess ? ResourceViewType::UnorderedAccess : ResourceViewType::ShaderResource;
 			viewDesc.dimension = desc.dimension;
 			viewDesc.asArray = desc.dimension != TextureDimension::Texture3D && desc.depthOrArraySize > 1;
-			viewDesc.baseMip = isMip ? node.mip : 0; // a whole texture's UAV is of mip 0
-			viewDesc.mipCount = isMip ? 1 : 0;
-			view = rc.CreateTextureView(texture, viewDesc);
+			viewDesc.baseMip = baseMip;
+			viewDesc.mipCount = mipCount;
+			views_.push_back({ texture, baseMip, mipCount, unorderedAccess, rc.CreateTextureView(texture, viewDesc) });
+			it = views_.end() - 1;
 		}
-		return view;
+		it->lastUsed = executions_;
+		return it->view;
+	}
+
+	std::vector<PassTiming> RenderGraph::GetPassTimings(const RenderContext &rc) const
+	{
+		std::vector<PassTiming> timings;
+		if (!compiled_)
+		{
+			return timings;
+		}
+		for (uint32_t s = 0; s < sections_.size(); ++s)
+		{
+			for (uint32_t q = 0; q < kQueueTypeCount; ++q)
+			{
+				for (const CompiledBatch &batch: sections_[s].queues[q].batches)
+				{
+					for (PassId passId: batch.passes)
+					{
+						PassTiming &timing = timings.emplace_back();
+						timing.name = passes_[passId.index].desc.name;
+						timing.queue = static_cast<QueueType>(q);
+						timing.section = s;
+						if (const GPUProfileScopeStats *stats = rc.GetProfileScopeStats(timing.name))
+						{
+							timing.stats = *stats;
+						}
+						else
+						{
+							timing.stats.name = timing.name;
+						}
+					}
+				}
+			}
+		}
+		return timings;
 	}
 
 	std::optional<TransientAllocation> RenderGraph::GetTransientAllocation(ResourceId resource) const
 	{
 		assert(resource.index < resources_.size());
 		const ResourceNode &node = resources_[resource.index];
-		if (node.imported || !IsUsed(node) || !compiled_)
+		if (node.imported || !IsUsed(node) || IsCommittedTransient(node) || !compiled_)
 		{
 			return std::nullopt;
 		}
@@ -1795,6 +2256,10 @@ namespace rg
 			{
 				out << "  " << node.name << " offset=" << node.offset << " size=" << node.size << " batches=["
 					<< node.firstBatch << "," << node.lastBatch << "]\n";
+			}
+			else if (IsCommittedTransient(node))
+			{
+				out << "  " << node.name << " committed size=" << node.bufferDesc.sizeInBytes << "\n";
 			}
 		}
 		return out.str();

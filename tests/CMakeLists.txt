@@ -28,6 +28,8 @@ set(RENDER_GRAPH_TESTS
     DepthTestReadsAndSamplingUseSeparateLayouts
     SubchannelSortingInsideBatch
     StaticGraphExecutesManyFrames
+    GraphRecompilesEveryFrame
+    UnchangedRecordingReusesTheCompile
     AsyncComputeOverlapsGraphics
     AsyncComputeQueueConflictRejected
     AsyncComputeImportedResourceRoundTrip
@@ -36,11 +38,13 @@ set(RENDER_GRAPH_TESTS
     TransientAliasingReusesMemory
     AliasingNeverOverlapsLiveMemoryRandomized
     AsyncSectionsDoNotAliasAcrossQueues
+    QueuesShareMemoryOnlyWhereTheyAlreadyWait
     WigglingShrinksTransientLifetimes
     InvalidGraphsAreRejected
     EveryAccessIsAValidBarrier
     MeshShaderPassOrdersReadsAndWrites
     RaytracingBuildsAndTracesInOrder
+    TransientTLASIsRebuiltEveryFrame
     BloomChainTransitionsEachMip
     RasterPassesDrawIntoMips
     ImportedTextureMipsEndInOneState

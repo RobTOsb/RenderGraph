@@ -529,3 +529,119 @@ RG_TEST(StaticGraphExecutesManyFrames)
 	assert(gpu.rc().GetResourceState(counterHandle) == rg::GetAccessState(Access::ComputeShaderReadWrite, false));
 	AssertBufferEquals(gpu.Read(counterHandle, kCount), [](uint32_t) { return 3 * kFrames; }, "Counter", &graph);
 }
+
+// Recorded every frame, but only compiled when the recording changes: a new pass, other compile options, or a
+// failed compile. Reused frames still run this frame's callbacks and write this frame's import.
+RG_TEST(UnchangedRecordingReusesTheCompile)
+{
+	GpuTest gpu;
+	const ResourceHandle outHandles[2] = { gpu.CreateBuffer(kCount, "OutA"), gpu.CreateBuffer(kCount, "OutB") };
+	RenderGraph graph;
+	rg::CompileOptions noAlias;
+	noAlias.aliasTransientMemory = false;
+
+	struct Frame
+	{
+		bool extraPass = false; // AddFour between AddOne and AddTwo
+		bool noAliasing = false;
+		bool valid = true; // without Fill, AddOne reads A before anything writes it
+		bool reused = false;
+	};
+	const Frame frames[] = {
+		{ false, false, true, false }, { false, false, true, true }, { false, false, true, true },
+		{ true, false, true, false },  { true, false, true, true },	 { false, false, true, false },
+		{ false, true, true, false },  { false, true, true, true },	 { false, true, false, false },
+		{ false, true, true, false },  { false, true, true, true },
+	};
+
+	for (uint32_t frame = 0; frame < std::size(frames); ++frame)
+	{
+		const Frame &f = frames[frame];
+		const ResourceHandle outHandle = outHandles[frame % 2];
+		graph.Reset();
+		const auto a = graph.CreateBuffer(UIntBuffer(kCount, "A"));
+		const auto b = graph.CreateBuffer(UIntBuffer(kCount, "B"));
+		const auto c = graph.CreateBuffer(UIntBuffer(kCount, "C"));
+		const auto out = graph.ImportBuffer(outHandle, "Out");
+		if (f.valid)
+		{
+			graph.AddPass(Pass::Compute("Fill").Writes(a).Executes([&, frame](PassContext &ctx) { gpu.Fill(ctx, a, frame, kCount); }));
+		}
+		graph.AddPass(Pass::Compute("AddOne").Reads(a).Writes(b).Executes([&](PassContext &ctx) { gpu.Add(ctx, a, b, 1, kCount); }));
+		const auto last = f.extraPass ? c : b;
+		if (f.extraPass)
+		{
+			graph.AddPass(Pass::Compute("AddFour").Reads(b).Writes(c).Executes([&](PassContext &ctx) { gpu.Add(ctx, b, c, 4, kCount); }));
+		}
+		graph.AddPass(Pass::Compute("AddTwo").Reads(last).Writes(out).Executes(
+				[&, last](PassContext &ctx) { gpu.Add(ctx, last, out, 2, kCount); }));
+
+		const bool compiled = graph.Compile(gpu.rc(), f.noAliasing ? noAlias : rg::CompileOptions{});
+		assert(compiled == f.valid);
+		assert(graph.WasLastCompileReused() == f.reused);
+		if (!compiled)
+		{
+			continue;
+		}
+
+		gpu.BeginFrame();
+		graph.Execute(gpu.rc());
+		gpu.EndFrame();
+		const uint32_t added = f.extraPass ? 7 : 3;
+		AssertBufferEquals(gpu.Read(outHandle, kCount), [&](uint32_t i) { return frame + i + added; }, "Out", &graph);
+	}
+
+	// Without a Reset, a recompile always compiles: the passes may have changed in place.
+	assert(graph.Compile(gpu.rc(), noAlias) && !graph.WasLastCompileReused());
+	graph.ReleaseResources();
+	gpu.rc().DestroyResource(outHandles[0]);
+	gpu.rc().DestroyResource(outHandles[1]);
+}
+
+// Reset, recorded and compiled every frame, switching between two sizes (Fill writes frame + i, then +1, +2): each size gets its transients
+// back, the first big frame grows the heap, and every frame's output is right, overlapping frames included.
+RG_TEST(GraphRecompilesEveryFrame)
+{
+	GpuTest gpu;
+	const ResourceHandle outHandle = gpu.CreateBuffer(kCount * 64, "Out");
+	RenderGraph graph;
+	std::vector<ResourceHandle> smallHandles[2];
+	std::vector<ResourceHandle> largeHandles[2];
+
+	constexpr uint32_t kFrames = 16;
+	for (uint32_t frame = 0; frame < kFrames; ++frame)
+	{
+		const bool isLarge = frame % 3 == 2;
+		const uint32_t count = isLarge ? kCount * 64 : kCount; // 64 KiB placements either way below that
+		graph.Reset();
+		const auto a = graph.CreateBuffer(UIntBuffer(count, "A"));
+		const auto b = graph.CreateBuffer(UIntBuffer(count, "B"));
+		const auto out = graph.ImportBuffer(outHandle, "Out");
+		graph.AddPass(Pass::Compute("Fill").Writes(a).Executes([&, frame](PassContext &ctx) { gpu.Fill(ctx, a, frame, count); }));
+		graph.AddPass(Pass::Compute("AddOne").Reads(a).Writes(b).Executes([&](PassContext &ctx) { gpu.Add(ctx, a, b, 1, count); }));
+		graph.AddPass(Pass::Compute("AddTwo").Reads(b).Writes(out).Executes([&](PassContext &ctx) { gpu.Add(ctx, b, out, 2, count); }));
+		assert(graph.Compile(gpu.rc()));
+
+		const bool wait = frame % 4 == 3;
+		gpu.BeginFrame();
+		graph.Execute(gpu.rc());
+		gpu.EndFrame(wait); // the other frames overlap the next one
+		(isLarge ? largeHandles : smallHandles)[0].push_back(graph.GetHandle(a));
+		(isLarge ? largeHandles : smallHandles)[1].push_back(graph.GetHandle(b));
+		if (wait)
+		{
+			AssertBufferEquals(gpu.Read(outHandle, count), [frame](uint32_t i) { return frame + i + 3; }, "Out", &graph);
+		}
+	}
+	gpu.rc().WaitForGPUIdle();
+	AssertBufferEquals(gpu.Read(outHandle, kCount), [](uint32_t i) { return kFrames - 1 + i + 3; }, "Out", &graph);
+
+	// Small frames 0 and 1 come before the heap grows, then every later smallHandles frame shares one set.
+	for (uint32_t r = 0; r < 2; ++r)
+	{
+		assert(smallHandles[r][0] == smallHandles[r][1]);
+		assert(smallHandles[r][2] != smallHandles[r][0] && "the heap grew, so new resources");
+		assert(std::all_of(smallHandles[r].begin() + 2, smallHandles[r].end(), [&](ResourceHandle h) { return h == smallHandles[r][2]; }));
+		assert(std::all_of(largeHandles[r].begin(), largeHandles[r].end(), [&](ResourceHandle h) { return h == largeHandles[r][0]; }));
+	}
+}

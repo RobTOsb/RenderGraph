@@ -303,7 +303,8 @@ RG_TEST(AsyncComputeTextureQueueTransfer)
 	AssertBufferEquals(gpu.Read(outHandle, kSize * kSize), [=](uint32_t) { return packed; }, "Pixels", &graph);
 }
 
-// The HTML printer draws every pass, one accent arrow per cross-queue wait, and escapes names.
+// The HTML printer draws every pass in the dependency graph and the schedule, accent arrows for cross-queue
+// reads and waits, a version of a resource per write, and escapes names.
 RG_TEST(HtmlDumpDrawsScheduleAndWaits)
 {
 	GpuTest gpu;
@@ -331,9 +332,15 @@ RG_TEST(HtmlDumpDrawsScheduleAndWaits)
 	};
 	assert(page.rfind("<!DOCTYPE html>", 0) == 0);
 	assert(count("Test &lt;graph&gt;") >= 1 && count("Test <graph>") == 0);
-	assert(count(">Produce</text>") == 1 && count(">Overlap</text>") == 1 && count(">Consume</text>") == 1);
-	assert(count(">Async &amp; Co</text>") == 1 && count("B&lt;&amp;&gt;") >= 1);
+	// Each pass is drawn once in the dependency graph and once in the schedule.
+	assert(count(">Produce</text>") == 2 && count(">Overlap</text>") == 2 && count(">Consume</text>") == 2);
+	assert(count(">Async &amp; Co</text>") == 2 && count("B&lt;&amp;&gt;") >= 1);
 	assert(count("url(#rg-schedule-arrow-accent)") == graph.GetQueueWaits().size() + 1); // plus the legend's
 	assert(count("aria-labelledby=\"rg-schedule-title rg-schedule-desc\"") == 1);
-	assert(count("<svg") == 2 && count("</svg>") == 2);
+	// A is read on compute after graphics wrote it, and B on graphics after compute did: two accent edges.
+	assert(count("aria-labelledby=\"rg-deps-title rg-deps-desc\"") == 1);
+	assert(count("url(#rg-deps-arrow-accent)") == 2 + 1); // plus the legend's
+	// Consume writes A again, so A has two versions, plus its row in the transient memory figure.
+	assert(count(">A</text>") == 3 && count(">v1 \xC2\xB7 ") == 1 && count(">v2 \xC2\xB7 ") == 1);
+	assert(count("<svg") == 3 && count("</svg>") == 3);
 }

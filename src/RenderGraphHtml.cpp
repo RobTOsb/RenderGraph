@@ -1,4 +1,4 @@
-// HTML printer for a compiled graph: a queue swimlane, transient memory lifetimes and a barrier table.
+// HTML printer for a compiled graph: a dependency graph, a queue swimlane, transient memory lifetimes and a barrier table.
 // Styled after the diagram-design skill (github.com/cathrynlavery/diagram-design): one self-contained page.
 #include <algorithm>
 #include <cctype>
@@ -358,7 +358,12 @@ namespace rg
 			void Path(const std::string &d, const char *stroke, double width, const char *marker)
 			{
 				out << "<path d=\"" << d << "\" fill=\"none\" stroke=\"" << stroke << "\" stroke-width=\"" << width
-					<< "\" marker-end=\"url(#" << marker << ")\"/>\n";
+					<< "\"";
+				if (marker)
+				{
+					out << " marker-end=\"url(#" << marker << ")\"";
+				}
+				out << "/>\n";
 			}
 
 			// The rectangular type tag of a node box: eyebrow text in a hairline box.
@@ -388,6 +393,9 @@ namespace rg
 				<< "-arrow\" markerWidth=\"8\" markerHeight=\"6\" refX=\"7\" refY=\"3\" orient=\"auto\">"
 				<< "<polygon points=\"0 0, 8 3, 0 6\" fill=\"" << kMuted << "\"/></marker>\n"
 				<< "<marker id=\"" << slug
+				<< "-arrow-ink\" markerWidth=\"8\" markerHeight=\"6\" refX=\"7\" refY=\"3\" orient=\"auto\">"
+				<< "<polygon points=\"0 0, 8 3, 0 6\" fill=\"" << kInk << "\"/></marker>\n"
+				<< "<marker id=\"" << slug
 				<< "-arrow-accent\" markerWidth=\"8\" markerHeight=\"6\" refX=\"7\" refY=\"3\" orient=\"auto\">"
 				<< "<polygon points=\"0 0, 8 3, 0 6\" fill=\"" << kAccent << "\"/></marker>\n</defs>\n"
 				<< "<rect width=\"100%\" height=\"100%\" fill=\"" << kPaper << "\"/>\n";
@@ -396,6 +404,434 @@ namespace rg
 		std::string Plural(size_t count, const char *word)
 		{
 			return std::to_string(count) + " " + word + (count == 1 ? "" : "S");
+		}
+
+		std::string FormatName(Format format)
+		{
+			switch (format)
+			{
+				case Format::R32G32B32A32_FLOAT: return "RGBA32F";
+				case Format::R32G32_UINT: return "RG32U";
+				case Format::R16G16B16A16_FLOAT: return "RGBA16F";
+				case Format::R16G16_FLOAT: return "RG16F";
+				case Format::R8G8_UNORM: return "RG8";
+				case Format::R8G8B8A8_UNORM: return "RGBA8";
+				case Format::R8G8B8A8_UNORM_SRGB: return "RGBA8 sRGB";
+				case Format::R10G10B10A2_UNORM: return "RGB10A2";
+				case Format::R32_TYPELESS: return "R32";
+				case Format::D32_FLOAT: return "D32F";
+				case Format::R32_FLOAT: return "R32F";
+				case Format::R32_UINT: return "R32U";
+				case Format::R24G8_TYPELESS: return "R24G8";
+				case Format::D24_UNORM_S8_UINT: return "D24S8";
+				case Format::R16_FLOAT: return "R16F";
+				case Format::R8_UNORM: return "R8";
+				case Format::R8_UINT: return "R8U";
+				case Format::B8G8R8A8_UNORM: return "BGRA8";
+				case Format::BC7_UNORM: return "BC7";
+				case Format::BC7_UNORM_SRGB: return "BC7 sRGB";
+				default: return "format " + std::to_string(static_cast<int>(format));
+			}
+		}
+
+		// Dependency graph: passes and resource versions as nodes, data flowing top to bottom in rows.
+		enum class EdgeStyle
+		{
+			Read,
+			Write,
+			CrossQueue // read on another queue than the one that wrote it
+		};
+
+		constexpr int kPassHeight = 56;
+		constexpr int kResourceHeight = 40;
+		constexpr int kRowGap = 56;
+		constexpr int kNodeGap = 24;
+		constexpr int kBendGap = 16; // next to a bend point, which has no width
+
+		struct GraphNode
+		{
+			std::string name;
+			std::string sublabel;
+			std::string tag; // a pass's kind
+			bool isPass = false;
+			bool asyncCompute = false;
+			bool imported = false;
+			bool bend = false; // where an edge crosses a row it skips
+			EdgeStyle bendStyle = EdgeStyle::Read;
+			double order = 0.0; // starting order inside a row
+			int layer = 0;
+			int x = 0;
+			int y = 0;
+			int w = 0;
+			int h = 0;
+		};
+
+		struct GraphEdge
+		{
+			uint32_t from = 0;
+			uint32_t to = 0;
+			EdgeStyle style = EdgeStyle::Read;
+			int fromX = 0; // ports, set by the layout
+			int toX = 0;
+		};
+
+		struct Graph
+		{
+			std::vector<GraphNode> nodes;
+			std::vector<GraphEdge> edges;
+			int width = 0;
+			int height = 0;
+		};
+
+		// Positions that keep the order and the gaps of a row while staying nearest to the desired ones.
+		// Subtracting each node's stack offset turns it into isotonic regression, solved by pooling adjacent violators.
+		std::vector<double> FitOrdered(const std::vector<double> &desired, const std::vector<double> &offset)
+		{
+			std::vector<double> value;
+			std::vector<size_t> count;
+			for (size_t i = 0; i < desired.size(); ++i)
+			{
+				value.push_back(desired[i] - offset[i]);
+				count.push_back(1);
+				while (value.size() > 1 && value[value.size() - 2] > value.back())
+				{
+					const size_t c = count.back();
+					const double v = value.back();
+					value.pop_back();
+					count.pop_back();
+					value.back() = (value.back() * static_cast<double>(count.back()) + v * static_cast<double>(c)) /
+								   static_cast<double>(count.back() + c);
+					count.back() += c;
+				}
+			}
+			std::vector<double> out;
+			for (size_t b = 0; b < value.size(); ++b)
+			{
+				for (size_t c = 0; c < count[b]; ++c)
+				{
+					out.push_back(value[b] + offset[out.size()]);
+				}
+			}
+			return out;
+		}
+
+		// Rows by longest path, bend points on edges that skip rows, barycentre ordering, then aligned positions.
+		void LayoutGraph(Graph &graph, int top, int minWidth)
+		{
+			std::vector<GraphNode> &nodes = graph.nodes;
+			const size_t realCount = nodes.size();
+			std::vector<std::vector<uint32_t>> successors(realCount);
+			std::vector<std::vector<uint32_t>> predecessors(realCount);
+			for (const GraphEdge &edge: graph.edges)
+			{
+				successors[edge.from].push_back(edge.to);
+				predecessors[edge.to].push_back(edge.from);
+			}
+			std::vector<size_t> waiting(realCount);
+			std::vector<uint32_t> ready;
+			for (uint32_t n = 0; n < realCount; ++n)
+			{
+				waiting[n] = predecessors[n].size();
+				if (waiting[n] == 0)
+				{
+					ready.push_back(n);
+				}
+			}
+			for (size_t i = 0; i < ready.size(); ++i)
+			{
+				for (uint32_t next: successors[ready[i]])
+				{
+					nodes[next].layer = std::max(nodes[next].layer, nodes[ready[i]].layer + 1);
+					if (--waiting[next] == 0)
+					{
+						ready.push_back(next);
+					}
+				}
+			}
+			// A source sits just above its first reader, so an import read late does not stretch down the graph.
+			for (uint32_t n = 0; n < realCount; ++n)
+			{
+				if (predecessors[n].empty() && !successors[n].empty())
+				{
+					int first = nodes[successors[n].front()].layer;
+					for (uint32_t next: successors[n])
+					{
+						first = std::min(first, nodes[next].layer);
+					}
+					nodes[n].layer = first - 1;
+				}
+			}
+
+			std::vector<GraphEdge> segments;
+			for (const GraphEdge &edge: graph.edges)
+			{
+				uint32_t from = edge.from;
+				const int end = nodes[edge.to].layer;
+				const double order = nodes[edge.from].order;
+				for (int layer = nodes[edge.from].layer + 1; layer < end; ++layer)
+				{
+					GraphNode bend;
+					bend.bend = true;
+					bend.bendStyle = edge.style;
+					bend.layer = layer;
+					bend.order = order;
+					nodes.push_back(bend);
+					segments.push_back({ from, static_cast<uint32_t>(nodes.size() - 1), edge.style });
+					from = static_cast<uint32_t>(nodes.size() - 1);
+				}
+				segments.push_back({ from, edge.to, edge.style });
+			}
+			graph.edges = std::move(segments);
+			successors.assign(nodes.size(), {});
+			predecessors.assign(nodes.size(), {});
+			for (const GraphEdge &edge: graph.edges)
+			{
+				successors[edge.from].push_back(edge.to);
+				predecessors[edge.to].push_back(edge.from);
+			}
+
+			int layerCount = 1;
+			for (const GraphNode &node: nodes)
+			{
+				layerCount = std::max(layerCount, node.layer + 1);
+			}
+			std::vector<std::vector<uint32_t>> layers(layerCount);
+			for (uint32_t n = 0; n < nodes.size(); ++n)
+			{
+				layers[nodes[n].layer].push_back(n);
+			}
+			std::vector<double> position(nodes.size());
+			auto number = [&](const std::vector<uint32_t> &layer)
+			{
+				for (size_t i = 0; i < layer.size(); ++i)
+				{
+					position[layer[i]] = static_cast<double>(i);
+				}
+			};
+			for (std::vector<uint32_t> &layer: layers)
+			{
+				std::stable_sort(layer.begin(),
+								 layer.end(),
+								 [&](uint32_t a, uint32_t b) { return nodes[a].order < nodes[b].order; });
+				number(layer);
+			}
+
+			// Barycentre sweeps, alternately from the top and from the bottom, to cut crossings.
+			std::vector<double> key(nodes.size());
+			for (int sweep = 0; sweep < 8; ++sweep)
+			{
+				const bool fromTop = sweep % 2 == 0;
+				for (int i = 1; i < layerCount; ++i)
+				{
+					std::vector<uint32_t> &layer = layers[fromTop ? i : layerCount - 1 - i];
+					for (uint32_t n: layer)
+					{
+						const std::vector<uint32_t> &adjacent = fromTop ? predecessors[n] : successors[n];
+						double sum = 0.0;
+						for (uint32_t a: adjacent)
+						{
+							sum += position[a];
+						}
+						key[n] = adjacent.empty() ? position[n] : sum / static_cast<double>(adjacent.size());
+					}
+					std::stable_sort(layer.begin(), layer.end(), [&](uint32_t a, uint32_t b) { return key[a] < key[b]; });
+					number(layer);
+				}
+			}
+
+			// Rows top to bottom, each as tall as its tallest node; a bend runs the full height of its row.
+			std::vector<int> rowY(layerCount);
+			std::vector<int> rowH(layerCount, 24);
+			for (const GraphNode &node: nodes)
+			{
+				if (!node.bend)
+				{
+					rowH[node.layer] = std::max(rowH[node.layer], node.h);
+				}
+			}
+			int y = top;
+			for (int l = 0; l < layerCount; ++l)
+			{
+				rowY[l] = y;
+				y += rowH[l] + kRowGap;
+			}
+			graph.height = y - kRowGap;
+			for (GraphNode &node: nodes)
+			{
+				if (node.bend)
+				{
+					node.y = rowY[node.layer];
+					node.h = rowH[node.layer];
+				}
+				else
+				{
+					node.y = rowY[node.layer] + RoundUp4((rowH[node.layer] - node.h) / 2.0);
+				}
+			}
+
+			// Across: each row moves towards the centres of its neighbours, keeping its order and gaps.
+			auto gap = [&](uint32_t a, uint32_t b) { return nodes[a].bend || nodes[b].bend ? kBendGap : kNodeGap; };
+			std::vector<std::vector<double>> offsets(layerCount);
+			for (int l = 0; l < layerCount; ++l)
+			{
+				const std::vector<uint32_t> &layer = layers[l];
+				offsets[l].assign(layer.size(), 0.0);
+				for (size_t i = 1; i < layer.size(); ++i)
+				{
+					offsets[l][i] = offsets[l][i - 1] + nodes[layer[i - 1]].w + gap(layer[i - 1], layer[i]);
+				}
+				for (size_t i = 0; i < layer.size(); ++i)
+				{
+					nodes[layer[i]].x = static_cast<int>(offsets[l][i]);
+				}
+			}
+			auto centre = [&](uint32_t n) { return nodes[n].x + nodes[n].w / 2.0; };
+			for (int round = 0; round < 8; ++round)
+			{
+				const bool fromTop = round % 2 == 0;
+				for (int i = 0; i < layerCount; ++i)
+				{
+					const int l = fromTop ? i : layerCount - 1 - i;
+					const std::vector<uint32_t> &layer = layers[l];
+					std::vector<double> desired(layer.size());
+					for (size_t k = 0; k < layer.size(); ++k)
+					{
+						const uint32_t n = layer[k];
+						const std::vector<uint32_t> &adjacent = fromTop ? predecessors[n] : successors[n];
+						if (adjacent.empty())
+						{
+							desired[k] = nodes[n].x;
+							continue;
+						}
+						double sum = 0.0;
+						for (uint32_t a: adjacent)
+						{
+							sum += centre(a);
+						}
+						desired[k] = sum / static_cast<double>(adjacent.size()) - nodes[n].w / 2.0;
+					}
+					const std::vector<double> fitted = FitOrdered(desired, offsets[l]);
+					for (size_t k = 0; k < layer.size(); ++k)
+					{
+						nodes[layer[k]].x = static_cast<int>(fitted[k] + 0.5);
+					}
+				}
+			}
+			int minX = nodes.empty() ? 0 : nodes.front().x;
+			int maxX = minX;
+			for (const GraphNode &node: nodes)
+			{
+				minX = std::min(minX, node.x);
+				maxX = std::max(maxX, node.x + node.w);
+			}
+			graph.width = std::max(minWidth, maxX - minX + 2 * kMargin);
+			// Centred when the figure is wider than the graph.
+			const int left = (graph.width - (maxX - minX)) / 2;
+			for (GraphNode &node: nodes)
+			{
+				node.x += left - minX;
+			}
+
+			// Ports spread along the top and bottom in the order of the nodes at the other end, so edges do not
+			// cross there.
+			std::vector<std::vector<size_t>> incoming(nodes.size());
+			std::vector<std::vector<size_t>> outgoing(nodes.size());
+			for (size_t e = 0; e < graph.edges.size(); ++e)
+			{
+				outgoing[graph.edges[e].from].push_back(e);
+				incoming[graph.edges[e].to].push_back(e);
+			}
+			for (uint32_t n = 0; n < nodes.size(); ++n)
+			{
+				const GraphNode &node = nodes[n];
+				std::sort(incoming[n].begin(),
+						  incoming[n].end(),
+						  [&](size_t a, size_t b) { return centre(graph.edges[a].from) < centre(graph.edges[b].from); });
+				std::sort(outgoing[n].begin(),
+						  outgoing[n].end(),
+						  [&](size_t a, size_t b) { return centre(graph.edges[a].to) < centre(graph.edges[b].to); });
+				for (size_t i = 0; i < incoming[n].size(); ++i)
+				{
+					graph.edges[incoming[n][i]].toX =
+							node.x + node.w * static_cast<int>(i + 1) / static_cast<int>(incoming[n].size() + 1);
+				}
+				for (size_t i = 0; i < outgoing[n].size(); ++i)
+				{
+					graph.edges[outgoing[n][i]].fromX =
+							node.x + node.w * static_cast<int>(i + 1) / static_cast<int>(outgoing[n].size() + 1);
+				}
+			}
+		}
+
+		const char *EdgeColour(EdgeStyle style)
+		{
+			return style == EdgeStyle::CrossQueue ? kAccent : style == EdgeStyle::Write ? kInk : kMuted;
+		}
+
+		void DrawGraph(Svg &svg, const Graph &graph, const std::string &slug)
+		{
+			const std::string markers[] = { slug + "-arrow", slug + "-arrow-ink", slug + "-arrow-accent" };
+			svg.out << "<!-- edges -->\n";
+			for (const GraphEdge &edge: graph.edges)
+			{
+				const GraphNode &from = graph.nodes[edge.from];
+				const GraphNode &to = graph.nodes[edge.to];
+				const int y1 = from.y + from.h;
+				const int y2 = to.y - (to.bend ? 0 : 2);
+				const int dy = std::max(12, (y2 - y1) / 2);
+				std::ostringstream d;
+				d << "M " << edge.fromX << "," << y1 << " C " << edge.fromX << "," << y1 + dy << " " << edge.toX << ","
+				  << y2 - dy << " " << edge.toX << "," << y2;
+				svg.Path(d.str(),
+						 EdgeColour(edge.style),
+						 edge.style == EdgeStyle::Read ? 1.2 : 1.4,
+						 to.bend ? nullptr : markers[static_cast<int>(edge.style)].c_str());
+			}
+			for (const GraphNode &node: graph.nodes)
+			{
+				if (node.bend)
+				{
+					svg.Line(node.x,
+							 node.y,
+							 node.x,
+							 node.y + node.h,
+							 EdgeColour(node.bendStyle),
+							 node.bendStyle == EdgeStyle::Read ? 1.2 : 1.4);
+				}
+			}
+
+			svg.out << "<!-- passes and resources -->\n";
+			for (const GraphNode &node: graph.nodes)
+			{
+				const double cx = node.x + node.w / 2.0;
+				if (node.isPass)
+				{
+					svg.Rect(node.x, node.y, node.w, node.h, 6, kPaper);
+					svg.Rect(node.x, node.y, node.w, node.h, 6, kPaper2, node.asyncCompute ? kAccent : kInk, 1);
+					svg.Tag(node.x + 8, node.y + 6, node.tag, kMuted);
+					if (node.asyncCompute)
+					{
+						svg.Tag(node.x + node.w - 8 - (MonoWidth("ASYNC", 7, 0.08) + 8), node.y + 6, "ASYNC", kAccent);
+					}
+					svg.Text(cx, node.y + 34, node.name, 12, kInk, kSans, "middle", 600);
+					svg.Text(cx, node.y + 48, node.sublabel, 9, kMuted, kMono, "middle");
+				}
+				else if (!node.bend)
+				{
+					svg.Rect(node.x, node.y, node.w, node.h, node.h / 2, kPaper);
+					svg.Rect(node.x,
+							 node.y,
+							 node.w,
+							 node.h,
+							 node.h / 2,
+							 kStoreFill,
+							 kMuted,
+							 1,
+							 node.imported ? "4,3" : nullptr);
+					svg.Text(cx, node.y + 17, node.name, 10, kInk, kMono, "middle", 500);
+					svg.Text(cx, node.y + 30, node.sublabel, 8, kSoft, kMono, "middle");
+				}
+			}
 		}
 	} // namespace
 
@@ -840,6 +1276,159 @@ namespace rg
 			}
 		}
 
+		// Dependencies: a resource gets a new version at each write, so the graph has no cycles.
+		Graph graph;
+		for (uint32_t p = 0; p < passes_.size(); ++p)
+		{
+			const PassNode &pass = passes_[p];
+			GraphNode node;
+			node.isPass = true;
+			node.name = pass.desc.name;
+			node.tag = KindName(pass.desc.kind);
+			node.asyncCompute = pass.desc.queue == QueueType::Compute;
+			node.sublabel = "section " + std::to_string(pass.section);
+			node.order = p;
+			node.h = kPassHeight;
+			node.w = std::max({ kMinBoxWidth,
+								SansWidth(node.name, 12) + 32,
+								MonoWidth(node.tag, 7, 0.08) + MonoWidth("ASYNC", 7, 0.08) + 40 });
+			graph.nodes.push_back(std::move(node));
+		}
+		// Accesses that also read what was there before, so they hang off the previous version.
+		auto alsoReads = [](Access access)
+		{
+			return access == Access::ComputeShaderReadWrite || access == Access::ColourAttachment ||
+				   access == Access::DepthStencilWrite;
+		};
+		auto describe = [&](uint32_t r)
+		{
+			const ResourceNode &node = resources_[r];
+			const ResourceNode &owner = resources_[Owner(r)];
+			if (node.imported || owner.imported)
+			{
+				return std::string(node.isTexture ? "imported texture" : "imported buffer");
+			}
+			if (HoldsAccelerationStructure(owner))
+			{
+				return "accel. structure \xC2\xB7 " + FormatBytes(owner.bufferDesc.sizeInBytes);
+			}
+			if (!node.isTexture)
+			{
+				return FormatBytes(owner.bufferDesc.sizeInBytes);
+			}
+			const TextureDesc &desc = owner.textureDesc;
+			return std::to_string(std::max(1u, desc.width >> node.mip)) + "x" +
+				   std::to_string(std::max(1u, desc.height >> node.mip)) + " " + FormatName(desc.format);
+		};
+		for (uint32_t r = 0; r < resources_.size(); ++r)
+		{
+			const ResourceNode &resource = resources_[r];
+			if (resource.timeline.empty())
+			{
+				continue;
+			}
+			const bool imported = resource.imported || resources_[Owner(r)].imported;
+			const AccessGroup &firstGroup = groups_[resource.timeline.front()];
+			const bool importedInput = imported && (!firstGroup.isWrite || alsoReads(firstGroup.firstAccess));
+			uint32_t versions = importedInput ? 1 : 0;
+			for (uint32_t g: resource.timeline)
+			{
+				versions += groups_[g].isWrite ? 1 : 0;
+			}
+			uint32_t version = 0;
+			auto addVersion = [&](double order)
+			{
+				GraphNode node;
+				node.name = resource.name;
+				node.sublabel = (versions > 1 ? "v" + std::to_string(++version) + " \xC2\xB7 " : "") + describe(r);
+				node.imported = imported;
+				node.order = order;
+				node.h = kResourceHeight;
+				node.w = std::max({ 112, MonoWidth(node.name, 10) + 40, MonoWidth(node.sublabel, 8) + 32 });
+				graph.nodes.push_back(std::move(node));
+				return static_cast<uint32_t>(graph.nodes.size() - 1);
+			};
+
+			uint32_t current = kNoNode;
+			bool written = false; // the current version comes from a pass, not from outside the graph
+			QueueType writer = QueueType::Graphics;
+			auto readEdge = [&](uint32_t p)
+			{
+				const bool cross = written && passes_[p].desc.queue != writer;
+				graph.edges.push_back({ current, p, cross ? EdgeStyle::CrossQueue : EdgeStyle::Read });
+			};
+			for (uint32_t g: resource.timeline)
+			{
+				const AccessGroup &group = groups_[g];
+				const double firstPass = group.passes.empty() ? 0.0 : group.passes.front();
+				if (current == kNoNode && (!group.isWrite || (imported && alsoReads(group.firstAccess))))
+				{
+					current = addVersion(firstPass - 0.5);
+				}
+				if (!group.isWrite || alsoReads(group.firstAccess))
+				{
+					if (current != kNoNode)
+					{
+						for (uint32_t p: group.passes)
+						{
+							readEdge(p);
+						}
+					}
+				}
+				if (group.isWrite)
+				{
+					const uint32_t next = addVersion(firstPass + 0.5);
+					for (uint32_t p: group.passes)
+					{
+						graph.edges.push_back({ p, next, EdgeStyle::Write });
+					}
+					current = next;
+					written = true;
+					writer = group.queue;
+				}
+			}
+		}
+		constexpr int kGraphTop = 32;
+		LayoutGraph(graph, kGraphTop, 880);
+		Svg deps;
+		DrawGraph(deps, graph, "rg-deps");
+		const int depsLegendY = graph.height + 32;
+		const int depsWidth = graph.width;
+		const int depsHeight = depsLegendY + 60;
+		{
+			deps.out << "<!-- legend -->\n";
+			deps.Line(kMargin, depsLegendY, depsWidth - kMargin, depsLegendY, kRule, 0.8);
+			deps.Text(kMargin, depsLegendY + 16, "LEGEND", 8, kMuted, kMono, "start", 500, 0.18);
+			const int ly = depsLegendY + 32;
+			int lx = kMargin;
+			auto item = [&](const std::string &label)
+			{
+				deps.Text(lx, ly + 9, label, 9, kMuted, kSans);
+				lx += SansWidth(label, 9) + 24;
+			};
+			deps.Rect(lx, ly, 16, 12, 2, kPaper2, kInk, 1);
+			lx += 24;
+			item("Pass");
+			deps.Rect(lx, ly, 16, 12, 2, kPaper2, kAccent, 1);
+			lx += 24;
+			item("Async compute pass");
+			deps.Rect(lx, ly, 24, 12, 6, kStoreFill, kMuted, 1);
+			lx += 32;
+			item("Transient resource");
+			deps.Rect(lx, ly, 24, 12, 6, kStoreFill, kMuted, 1, "4,3");
+			lx += 32;
+			item("Imported");
+			deps.Line(lx, ly + 6, lx + 28, ly + 6, kInk, 1.4, nullptr, "rg-deps-arrow-ink");
+			lx += 36;
+			item("Writes");
+			deps.Line(lx, ly + 6, lx + 28, ly + 6, kMuted, 1.2, nullptr, "rg-deps-arrow");
+			lx += 36;
+			item("Reads");
+			deps.Line(lx, ly + 6, lx + 28, ly + 6, kAccent, 1.4, nullptr, "rg-deps-arrow-accent");
+			lx += 36;
+			item("Read on another queue");
+		}
+
 		// Page.
 		size_t queueSyncs = 0;
 		for (const QueueWaitInfo &wait: queueWaits_)
@@ -914,6 +1503,16 @@ p.empty { font-family: var(--mono); font-size: 0.75rem; color: var(--muted); }
 			card("Transient memory", "0 B", "no transient resources");
 		}
 		html << "</div>\n";
+
+		html << "<section>\n<p class=\"eyebrow\">Dependencies</p>\n<div class=\"figure\">\n";
+		OpenSvg(html,
+				"rg-deps",
+				depsWidth,
+				depsHeight,
+				title + " dependencies",
+				"Data flow through the render graph: passes and resource versions, each write making a new version, "
+				"with arrows from writers to the versions they produce and from versions to the passes that read them.");
+		html << deps.out.str() << "</svg>\n</div>\n</section>\n";
 
 		html << "<section>\n<p class=\"eyebrow\">Schedule</p>\n<div class=\"figure\">\n";
 		OpenSvg(html,

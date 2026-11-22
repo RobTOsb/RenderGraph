@@ -289,7 +289,7 @@ namespace
 		depthInfo.rasterizerState.cullMode = CullMode::None;
 		depthInfo.depthStencilState = DepthStencilStateDesc::ReversedZ();
 		depthInfo.depthStencilFormat = Format::D32_FLOAT;
-		depthInfo.renderTargetFormats = { Format::R32G32B32A32_FLOAT };
+		depthInfo.renderTargetFormats = { Format::R16G16B16A16_FLOAT };
 		const PipelineHandle depthPipeline = CreatePipeline(
 				*rc,
 				"scene.slang",
@@ -349,7 +349,7 @@ namespace
 					graph.CreateTexture(RenderTargetDesc(width, height, Format::R16G16B16A16_FLOAT, "Normal"));
 			// Normal and depth for AO and its blur: written by the prepass for SSAO, and by RTAO's primary rays.
 			const auto aoInput = graph.CreateTexture(
-					RenderTargetDesc(width, height, Format::R32G32B32A32_FLOAT, useRTAO ? "TracedSurface" : "AOInput"));
+					RenderTargetDesc(width, height, Format::R16G16B16A16_FLOAT, useRTAO ? "TracedSurface" : "AOInput"));
 			const auto aoRaw = graph.CreateTexture(RenderTargetDesc(width, height, Format::R8_UNORM, "AORaw"));
 			const auto ao = graph.CreateTexture(RenderTargetDesc(width, height, Format::R8_UNORM, "AO"));
 			const auto backBuffer = graph.ImportTexture(currentBackBuffer, "BackBuffer");

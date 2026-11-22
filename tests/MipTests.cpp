@@ -288,10 +288,10 @@ RG_TEST(RasterPassesDrawIntoMips)
 
 	PipelineEntryPoint entries[] = { { "vsFullscreen", PipelineShaderStage::Vertex }, { "psDown", PipelineShaderStage::Pixel } };
 	GraphicsPipelineCreateInfo info;
-	info.rasterizerState.cullMode = D3D12_CULL_MODE_NONE;
-	info.depthStencilState.depthEnable = FALSE;
-	info.depthStencilState.depthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
-	info.rtvFormats = { DXGI_FORMAT_R32_UINT };
+	info.rasterizerState.cullMode = CullMode::None;
+	info.depthStencilState.depthEnable = false;
+	info.depthStencilState.depthWrite = false;
+	info.renderTargetFormats = { Format::R32_UINT };
 	const PipelineHandle pipeline =
 			gpu.rc().CreateGraphicsPipeline(std::string(RG_TEST_SHADER_DIR) + "/mips.slang", entries, info);
 	assert(pipeline != InvalidPipelineHandle);

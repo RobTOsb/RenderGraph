@@ -2,6 +2,8 @@
 
 #include "TestCommon.h"
 
+#include <algorithm>
+
 using namespace rgtest;
 using rg::Access;
 using rg::BarrierKind;

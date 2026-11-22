@@ -1,5 +1,6 @@
-// Cornell box rendered through the render graph: reversed Z depth prepass, G-buffer, SSAO or RTAO, blur, deferred lighting.
-// Left drag orbits, the wheel zooms, 1-4 pick lit/AO/albedo/normals, O toggles AO, R auto-rotates and Esc quits.
+// Cornell box rendered through the render graph: reversed Z depth prepass, G-buffer, SSAO or RTAO, blur, deferred
+// lighting. Left drag orbits, the wheel zooms, 1-4 pick lit/AO/albedo/normals, O toggles AO, R auto-rotates and Esc
+// quits.
 
 #include <DirectXMath.h>
 
@@ -285,10 +286,10 @@ namespace
 
 		// Pipelines. The prepass and G-buffer pass share a vertex shader so their depths match exactly.
 		GraphicsPipelineCreateInfo depthInfo;
-		depthInfo.rasterizerState.cullMode = D3D12_CULL_MODE_NONE;
+		depthInfo.rasterizerState.cullMode = CullMode::None;
 		depthInfo.depthStencilState = DepthStencilStateDesc::ReversedZ();
-		depthInfo.dsvFormat = DXGI_FORMAT_D32_FLOAT;
-		depthInfo.rtvFormats = { DXGI_FORMAT_R32G32B32A32_FLOAT };
+		depthInfo.depthStencilFormat = Format::D32_FLOAT;
+		depthInfo.renderTargetFormats = { Format::R32G32B32A32_FLOAT };
 		const PipelineHandle depthPipeline = CreatePipeline(
 				*rc,
 				"scene.slang",
@@ -297,14 +298,14 @@ namespace
 
 		// RTAO traces its own surfaces, so its prepass only writes depth.
 		GraphicsPipelineCreateInfo depthOnlyInfo = depthInfo;
-		depthOnlyInfo.rtvFormats = {};
+		depthOnlyInfo.renderTargetFormats = {};
 		const PipelineHandle depthOnlyPipeline =
 				CreatePipeline(*rc, "scene.slang", { { "vsMain", PipelineShaderStage::Vertex } }, depthOnlyInfo);
 
 		GraphicsPipelineCreateInfo gbufferInfo = depthInfo;
-		gbufferInfo.depthStencilState.depthFunc = D3D12_COMPARISON_FUNC_EQUAL;
-		gbufferInfo.depthStencilState.depthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
-		gbufferInfo.rtvFormats = { DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM };
+		gbufferInfo.depthStencilState.depthFunc = CompareFunc::Equal;
+		gbufferInfo.depthStencilState.depthWrite = false;
+		gbufferInfo.renderTargetFormats = { Format::R16G16B16A16_FLOAT, Format::R8G8B8A8_UNORM };
 		const PipelineHandle gbufferPipeline = CreatePipeline(
 				*rc,
 				"scene.slang",
@@ -312,15 +313,15 @@ namespace
 				gbufferInfo);
 
 		GraphicsPipelineCreateInfo fullscreenInfo;
-		fullscreenInfo.rasterizerState.cullMode = D3D12_CULL_MODE_NONE;
-		fullscreenInfo.depthStencilState.depthEnable = FALSE;
-		fullscreenInfo.depthStencilState.depthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+		fullscreenInfo.rasterizerState.cullMode = CullMode::None;
+		fullscreenInfo.depthStencilState.depthEnable = false;
+		fullscreenInfo.depthStencilState.depthWrite = false;
 		const PipelineHandle ssaoPipeline = rc->CreateComputePipeline(ShaderPath("ssao.slang"), "csSSAO");
 		const PipelineHandle blurPipeline = rc->CreateComputePipeline(ShaderPath("ssao.slang"), "csBlur");
 		const PipelineHandle rtaoPipeline = rc->CreateComputePipeline(ShaderPath("rtao.slang"), "csRTAO");
 
 		GraphicsPipelineCreateInfo lightingInfo = fullscreenInfo;
-		lightingInfo.rtvFormats = { static_cast<DXGI_FORMAT>(backBufferFormat) };
+		lightingInfo.renderTargetFormats = { backBufferFormat };
 		const PipelineHandle lightingPipeline = CreatePipeline(
 				*rc,
 				"lighting.slang",
@@ -333,7 +334,7 @@ namespace
 		RenderGraph graph;
 		graph.SetProfilePasses(true); // each pass gets a GPU timestamp scope, shown in the UI
 		bool useRTAO = true;
-		bool asyncCompute = true; // off puts the AO and acceleration structure passes on the graphics queue
+		bool asyncCompute = false; // off puts the AO and acceleration structure passes on the graphics queue
 		bool blasBuilt = false;
 		float compileMilliseconds = 0.0f;
 		uint32_t fullCompiles = 0;
@@ -344,7 +345,8 @@ namespace
 			depthDesc.clearValue.depth = 0.0f; // reversed Z clears to the far plane at 0
 			const auto depth = graph.CreateTexture(depthDesc);
 			const auto albedo = graph.CreateTexture(RenderTargetDesc(width, height, Format::R8G8B8A8_UNORM, "Albedo"));
-			const auto normal = graph.CreateTexture(RenderTargetDesc(width, height, Format::R16G16B16A16_FLOAT, "Normal"));
+			const auto normal =
+					graph.CreateTexture(RenderTargetDesc(width, height, Format::R16G16B16A16_FLOAT, "Normal"));
 			// Normal and depth for AO and its blur: written by the prepass for SSAO, and by RTAO's primary rays.
 			const auto aoInput = graph.CreateTexture(
 					RenderTargetDesc(width, height, Format::R32G32B32A32_FLOAT, useRTAO ? "TracedSurface" : "AOInput"));
@@ -377,19 +379,21 @@ namespace
 				const auto tlasScratch = graph.CreateBuffer(scratchDesc);
 				if (buildBLAS)
 				{
-					graph.AddPass(Pass::Compute("BuildBLAS")
-										  .OnQueue(aoQueue)
-										  .Use(sceneBLAS, Access::AccelerationStructureBuildWrite)
-										  .Executes([&](PassContext &ctx) { ctx.rc.BuildAccelerationStructure(blas); }));
+					graph.AddPass(
+							Pass::Compute("BuildBLAS")
+									.OnQueue(aoQueue)
+									.Use(sceneBLAS, Access::AccelerationStructureBuildWrite)
+									.Executes([&](PassContext &ctx) { ctx.rc.BuildAccelerationStructure(blas); }));
 				}
-				graph.AddPass(Pass::Compute("BuildTLAS")
-									  .OnQueue(aoQueue)
-									  .Use(sceneBLAS, Access::AccelerationStructureBuildRead)
-									  .Use(tlasScratch, Access::AccelerationStructureScratch)
-									  .Use(sceneTLAS, Access::AccelerationStructureBuildWrite)
-									  // By value: the scratch id is scoped to this block, and the pass runs after it ends.
-									  .Executes([&, tlasScratch](PassContext &ctx)
-												{ ctx.rc.BuildTLASInto(tlas, ctx.Get(sceneTLAS), ctx.Get(tlasScratch)); }));
+				graph.AddPass(
+						Pass::Compute("BuildTLAS")
+								.OnQueue(aoQueue)
+								.Use(sceneBLAS, Access::AccelerationStructureBuildRead)
+								.Use(tlasScratch, Access::AccelerationStructureScratch)
+								.Use(sceneTLAS, Access::AccelerationStructureBuildWrite)
+								// By value: the scratch id is scoped to this block, and the pass runs after it ends.
+								.Executes([&, tlasScratch](PassContext &ctx)
+										  { ctx.rc.BuildTLASInto(tlas, ctx.Get(sceneTLAS), ctx.Get(tlasScratch)); }));
 			}
 			Pass prepass = Pass::Graphics("DepthPrepass")
 								   .Use(depth, Access::DepthStencilWrite)
@@ -447,7 +451,8 @@ namespace
 
 			// SSAO and the blur read the surface in aoInput, which RTAO writes. Setting a pipeline resets its
 			// bindings, so everything is bound after it.
-			auto dispatchAO = [&](PassContext &ctx, PipelineHandle pipeline, rg::ResourceId output, rg::ResourceId rawAO = {})
+			auto dispatchAO =
+					[&](PassContext &ctx, PipelineHandle pipeline, rg::ResourceId output, rg::ResourceId rawAO = {})
 			{
 				ctx.rc.SetComputePipeline(pipeline);
 				ctx.rc.SetComputeConstantBufferByName("g_Frame", frameConstants);
@@ -482,18 +487,11 @@ namespace
 			}
 			else
 			{
-				graph.AddPass(Pass::Compute("SSAO")
-									  .OnQueue(aoQueue)
-									  .Reads(aoInput)
-									  .Writes(aoRaw)
-									  .Executes([&](PassContext &ctx) { dispatchAO(ctx, ssaoPipeline, aoRaw); }));
+				graph.AddPass(Pass::Compute("SSAO").OnQueue(aoQueue).Reads(aoInput).Writes(aoRaw).Executes(
+						[&](PassContext &ctx) { dispatchAO(ctx, ssaoPipeline, aoRaw); }));
 			}
-			graph.AddPass(Pass::Compute("AOBlur")
-								  .OnQueue(aoQueue)
-								  .Reads(aoInput)
-								  .Reads(aoRaw)
-								  .Writes(ao)
-								  .Executes([&](PassContext &ctx) { dispatchAO(ctx, blurPipeline, ao, aoRaw); }));
+			graph.AddPass(Pass::Compute("AOBlur").OnQueue(aoQueue).Reads(aoInput).Reads(aoRaw).Writes(ao).Executes(
+					[&](PassContext &ctx) { dispatchAO(ctx, blurPipeline, ao, aoRaw); }));
 			graph.Submit();
 
 			graph.AddPass(Pass::Graphics("Lighting")
@@ -620,15 +618,19 @@ namespace
 				rc->ImguiNewFrame();
 				ImGui::SetNextWindowPos(ImVec2(16.0f, 16.0f), ImGuiCond_FirstUseEver);
 				ImGui::Begin("Ambient occlusion", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
-				ImGui::Text("%.1f fps, %.3f ms a frame (worst %.3f ms)", framesPerSecond, frameMilliseconds, worstFrameMilliseconds);
+				ImGui::Text("%.1f fps, %.3f ms a frame (worst %.3f ms)",
+							framesPerSecond,
+							frameMilliseconds,
+							worstFrameMilliseconds);
 				// The graphics queue from the first pass to the last, waits for async compute included.
-				const GPUProfileScopeStats *gpuFrame = rc->GetProfileScopeStats(kGpuFrameScope);
+				const std::optional<GPUProfileScopeStats> gpuFrame = rc->GetProfileScopeStats(kGpuFrameScope);
 				ImGui::Text("GPU frame %.3f ms (worst %.3f ms)",
 							gpuFrame ? gpuFrame->averageMs : 0.0f,
 							gpuFrame ? gpuFrame->maxMs : 0.0f);
 				ImGui::Separator();
 				ImGui::Checkbox("Ray traced (RTAO)", &useRTAO);
-				ImGui::TextUnformatted(useRTAO ? "8 rays per pixel against the scene TLAS" : "16 depth buffer samples per pixel");
+				ImGui::TextUnformatted(useRTAO ? "8 rays per pixel against the scene TLAS"
+											   : "16 depth buffer samples per pixel");
 				ImGui::Checkbox("Async compute", &asyncCompute);
 				ImGui::TextUnformatted(asyncCompute ? "AO and the TLAS build overlap the raster passes"
 													: "Every pass runs on the graphics queue");

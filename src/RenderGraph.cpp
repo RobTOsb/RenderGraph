@@ -2145,7 +2145,7 @@ namespace rg
 						timing.name = passes_[passId.index].desc.name;
 						timing.queue = static_cast<QueueType>(q);
 						timing.section = s;
-						if (const GPUProfileScopeStats *stats = rc.GetProfileScopeStats(timing.name))
+						if (const std::optional<GPUProfileScopeStats> stats = rc.GetProfileScopeStats(timing.name))
 						{
 							timing.stats = *stats;
 						}

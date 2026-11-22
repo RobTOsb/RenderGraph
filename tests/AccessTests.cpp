@@ -335,10 +335,10 @@ RG_TEST(MeshShaderPassOrdersReadsAndWrites)
 									 { "msMain", PipelineShaderStage::Mesh },
 									 { "psMain", PipelineShaderStage::Pixel } };
 	GraphicsPipelineCreateInfo info;
-	info.pipelineType = PipelineType::GRAPHICS_MESH;
-	info.rasterizerState.cullMode = D3D12_CULL_MODE_NONE;
-	info.depthStencilState.depthEnable = FALSE;
-	info.depthStencilState.depthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+	info.pipelineType = GraphicsPipelineType::Mesh;
+	info.rasterizerState.cullMode = CullMode::None;
+	info.depthStencilState.depthEnable = false;
+	info.depthStencilState.depthWrite = false;
 	const PipelineHandle pipeline = gpu.rc().CreateGraphicsPipeline(ShaderPath("mesh_access.slang"), entries, info);
 	assert(pipeline != InvalidPipelineHandle);
 

@@ -1459,6 +1459,10 @@ h1 { font-family: var(--serif); font-size: 2rem; font-weight: 400; letter-spacin
 section { margin-top: 2.5rem; }
 .figure { overflow-x: auto; }
 .figure svg { display: block; width: 100%; height: auto; }
+.figure.zoom { overflow: hidden; height: 80vh; min-height: 240px; border: 1px solid var(--rule); border-radius: 6px; cursor: grab; touch-action: none; user-select: none; -webkit-user-select: none; }
+.figure.zoom.dragging { cursor: grabbing; }
+.figure.zoom svg { width: 100%; height: 100%; min-width: 0 !important; }
+.hint { font-family: var(--mono); font-size: 0.62rem; letter-spacing: 0.08em; color: var(--soft); text-transform: none; margin-left: 0.75rem; }
 .cards { display: grid; grid-template-columns: 1.1fr 1fr 0.9fr 1.2fr; gap: 12px; }
 .card { background: var(--paper-2); border: 1px solid var(--rule); border-radius: 6px; padding: 16px 20px; }
 .card .value { font-family: var(--serif); font-size: 2rem; line-height: 1.1; }
@@ -1504,7 +1508,8 @@ p.empty { font-family: var(--mono); font-size: 0.75rem; color: var(--muted); }
 		}
 		html << "</div>\n";
 
-		html << "<section>\n<p class=\"eyebrow\">Dependencies</p>\n<div class=\"figure\">\n";
+		html << "<section>\n<p class=\"eyebrow\">Dependencies<span class=\"hint\">scroll to zoom \xC2\xB7 drag to pan "
+				"\xC2\xB7 double-click to fit</span></p>\n<div class=\"figure zoom\">\n";
 		OpenSvg(html,
 				"rg-deps",
 				depsWidth,
@@ -1577,7 +1582,69 @@ p.empty { font-family: var(--mono); font-size: 0.75rem; color: var(--muted); }
 				}
 			}
 		}
-		html << "</table>\n</section>\n</div>\n</body>\n</html>\n";
+		html << "</table>\n</section>\n</div>\n";
+		// Pan and zoom for the .zoom figures by moving the SVG's viewBox: the wheel zooms about the cursor, a left drag
+		// pans, a double-click fits the whole figure again.
+		html << R"(<script>
+document.querySelectorAll('.figure.zoom').forEach(function (fig) {
+  var svg = fig.querySelector('svg');
+  var b = svg.viewBox.baseVal;
+  var home = { x: b.x, y: b.y, w: b.width, h: b.height };
+  var view = Object.assign({}, home);
+  function fitHeight() {
+    var h = Math.min(window.innerHeight * 0.8, fig.clientWidth * home.h / home.w);
+    fig.style.height = Math.max(240, h) + 'px';
+  }
+  function apply() { svg.setAttribute('viewBox', view.x + ' ' + view.y + ' ' + view.w + ' ' + view.h); }
+  function toSvg(clientX, clientY) {
+    var p = svg.createSVGPoint();
+    p.x = clientX; p.y = clientY;
+    return p.matrixTransform(svg.getScreenCTM().inverse());
+  }
+  fitHeight();
+  window.addEventListener('resize', fitHeight);
+  fig.addEventListener('wheel', function (e) {
+    e.preventDefault();
+    var delta = e.deltaY * (e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? 400 : 1);
+    var w = Math.min(home.w * 2, Math.max(home.w / 50, view.w * Math.exp(delta * 0.0015)));
+    var k = w / view.w;
+    var p = toSvg(e.clientX, e.clientY);
+    view.x = p.x - (p.x - view.x) * k;
+    view.y = p.y - (p.y - view.y) * k;
+    view.w = w;
+    view.h *= k;
+    apply();
+  }, { passive: false });
+  var drag = null;
+  fig.addEventListener('pointerdown', function (e) {
+    if (e.button !== 0) return;
+    drag = { x: e.clientX, y: e.clientY };
+    fig.setPointerCapture(e.pointerId);
+    fig.classList.add('dragging');
+    e.preventDefault();
+  });
+  fig.addEventListener('pointermove', function (e) {
+    if (!drag) return;
+    var scale = svg.getScreenCTM().a;
+    view.x -= (e.clientX - drag.x) / scale;
+    view.y -= (e.clientY - drag.y) / scale;
+    drag.x = e.clientX; drag.y = e.clientY;
+    apply();
+  });
+  function end(e) {
+    if (!drag) return;
+    drag = null;
+    fig.classList.remove('dragging');
+    if (fig.hasPointerCapture(e.pointerId)) fig.releasePointerCapture(e.pointerId);
+  }
+  fig.addEventListener('pointerup', end);
+  fig.addEventListener('pointercancel', end);
+  fig.addEventListener('dblclick', function () { view = Object.assign({}, home); apply(); });
+});
+</script>
+</body>
+</html>
+)";
 		return html.str();
 	}
 } // namespace rg
